@@ -5,6 +5,10 @@ readonly GITLEAKS_VERSION="8.30.1"
 temporary_root=""
 gitleaks_binary=""
 scan_output=""
+path_inventory=""
+asset=""
+expected_archive_sha=""
+expected_binary_sha=""
 
 cleanup() {
   if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
@@ -12,6 +16,9 @@ cleanup() {
   fi
   if [[ -n "$scan_output" && -f "$scan_output" ]]; then
     rm -f -- "$scan_output"
+  fi
+  if [[ -n "$path_inventory" && -f "$path_inventory" ]]; then
+    rm -f -- "$path_inventory"
   fi
 }
 trap cleanup EXIT
@@ -21,49 +28,8 @@ blocked() {
   exit 1
 }
 
-resolve_gitleaks() {
-  if [[ -n "${GITLEAKS_BIN:-}" ]]; then
-    [[ -x "$GITLEAKS_BIN" ]] || blocked scanner-unavailable
-    gitleaks_binary="$GITLEAKS_BIN"
-    return
-  fi
-  if command -v gitleaks >/dev/null 2>&1; then
-    gitleaks_binary=$(command -v gitleaks)
-    return
-  fi
-
-  local operating_system architecture asset expected_sha archive binary
-  operating_system=$(uname -s)
-  architecture=$(uname -m)
-  case "$operating_system/$architecture" in
-    Darwin/arm64)
-      asset="gitleaks_${GITLEAKS_VERSION}_darwin_arm64.tar.gz"
-      expected_sha="b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"
-      ;;
-    Darwin/x86_64)
-      asset="gitleaks_${GITLEAKS_VERSION}_darwin_x64.tar.gz"
-      expected_sha="dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709"
-      ;;
-    Linux/aarch64 | Linux/arm64)
-      asset="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"
-      expected_sha="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
-      ;;
-    Linux/x86_64 | Linux/amd64)
-      asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-      expected_sha="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-      ;;
-    *) blocked unsupported-platform ;;
-  esac
-
-  temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/sangrep-gitleaks.XXXXXX")
-  archive="$temporary_root/$asset"
-  binary="$temporary_root/gitleaks"
-  if ! curl --fail --location --silent \
-    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}" \
-    --output "$archive" 2>/dev/null; then
-    blocked scanner-download-failed
-  fi
-  if ! python3 - "$archive" "$expected_sha" <<'PY'
+sha_matches() {
+  python3 - "$1" "$2" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -74,14 +40,86 @@ from pathlib import Path
 actual = hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest()
 raise SystemExit(0 if hmac.compare_digest(actual, sys.argv[2]) else 1)
 PY
-  then
+}
+
+select_platform() {
+  local operating_system architecture
+  operating_system=$(uname -s)
+  architecture=$(uname -m)
+  case "$operating_system/$architecture" in
+    Darwin/arm64)
+      asset="gitleaks_${GITLEAKS_VERSION}_darwin_arm64.tar.gz"
+      expected_archive_sha="b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"
+      expected_binary_sha="ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f"
+      ;;
+    Darwin/x86_64)
+      asset="gitleaks_${GITLEAKS_VERSION}_darwin_x64.tar.gz"
+      expected_archive_sha="dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709"
+      expected_binary_sha="cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291"
+      ;;
+    Linux/aarch64 | Linux/arm64)
+      asset="gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"
+      expected_archive_sha="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
+      expected_binary_sha="00e91bbe655bd7c47753e8cfe61cb76ea1a5d7e7702fe161ee40102b46b3823b"
+      ;;
+    Linux/x86_64 | Linux/amd64)
+      asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+      expected_archive_sha="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+      expected_binary_sha="88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509"
+      ;;
+    *) blocked unsupported-platform ;;
+  esac
+}
+
+binary_is_verified() {
+  local candidate="$1"
+  [[ -x "$candidate" ]] || return 1
+  [[ "$($candidate version 2>/dev/null)" == "$GITLEAKS_VERSION" ]] || return 1
+  sha_matches "$candidate" "$expected_binary_sha"
+}
+
+resolve_gitleaks() {
+  local candidate archive binary
+  select_platform
+  if [[ -n "${SANGREP_GITLEAKS_TEST_BIN:-}" ]]; then
+    if [[ "${SANGREP_GITLEAKS_TEST_MODE:-}" != "true" || -z "${PYTEST_CURRENT_TEST:-}" ]]; then
+      blocked test-scanner-forbidden
+    fi
+    [[ -x "$SANGREP_GITLEAKS_TEST_BIN" ]] || blocked scanner-unavailable
+    [[ "$($SANGREP_GITLEAKS_TEST_BIN version 2>/dev/null)" == "$GITLEAKS_VERSION" ]] || \
+      blocked scanner-version-mismatch
+    gitleaks_binary="$SANGREP_GITLEAKS_TEST_BIN"
+    return
+  fi
+  if [[ -n "${GITLEAKS_BIN:-}" ]]; then
+    binary_is_verified "$GITLEAKS_BIN" || blocked scanner-verification-failed
+    gitleaks_binary="$GITLEAKS_BIN"
+    return
+  fi
+  if command -v gitleaks >/dev/null 2>&1; then
+    candidate=$(command -v gitleaks)
+    if binary_is_verified "$candidate"; then
+      gitleaks_binary="$candidate"
+      return
+    fi
+  fi
+
+  temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/sangrep-gitleaks.XXXXXX")
+  archive="$temporary_root/$asset"
+  binary="$temporary_root/gitleaks"
+  if ! curl --fail --location --silent \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}" \
+    --output "$archive" 2>/dev/null; then
+    blocked scanner-download-failed
+  fi
+  if ! sha_matches "$archive" "$expected_archive_sha"; then
     blocked scanner-verification-failed
   fi
   if ! tar -xzf "$archive" -C "$temporary_root" gitleaks >/dev/null 2>&1; then
     blocked scanner-extraction-failed
   fi
   chmod 0700 "$binary"
-  [[ "$($binary version 2>/dev/null)" == "$GITLEAKS_VERSION" ]] || blocked scanner-version-mismatch
+  binary_is_verified "$binary" || blocked scanner-verification-failed
   gitleaks_binary="$binary"
 }
 
@@ -114,7 +152,16 @@ PY
 }
 
 resolve_gitleaks
-scan_arguments=(git --redact=100 --no-banner --no-color --log-level=error)
+scan_output=$(mktemp "${TMPDIR:-/tmp}/sangrep-gitleaks-output.XXXXXX")
+
+run_scan() {
+  if ! "$gitleaks_binary" "$@" >"$scan_output" 2>&1; then
+    blocked gitleaks-nonzero
+  fi
+  : >"$scan_output"
+}
+
+history_arguments=(git --redact=100 --no-banner --no-color --log-level=error)
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   if ! range=$(event_range); then
     blocked event-range-invalid
@@ -122,16 +169,26 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   IFS=$'\t' read -r base_sha head_sha <<<"$range"
   git cat-file -e "${base_sha}^{commit}" 2>/dev/null || blocked base-commit-unavailable
   git cat-file -e "${head_sha}^{commit}" 2>/dev/null || blocked head-commit-unavailable
-  scan_arguments+=("--log-opts=${base_sha}..${head_sha}")
+  history_arguments+=("--log-opts=${base_sha}..${head_sha}")
 else
-  scan_arguments+=(--staged)
+  history_arguments+=(--staged)
 fi
-scan_arguments+=(.)
+history_arguments+=(.)
+run_scan "${history_arguments[@]}"
 
-scan_output=$(mktemp "${TMPDIR:-/tmp}/sangrep-gitleaks-output.XXXXXX")
-if ! "$gitleaks_binary" "${scan_arguments[@]}" >"$scan_output" 2>&1; then
-  blocked gitleaks-nonzero
+path_inventory=$(mktemp "${TMPDIR:-/tmp}/sangrep-gitleaks-paths.XXXXXX")
+if ! git diff --name-only --diff-filter=ACMR -z >"$path_inventory"; then
+  blocked working-output-inventory-failed
 fi
+if ! git ls-files --others --exclude-standard -z >>"$path_inventory"; then
+  blocked working-output-inventory-failed
+fi
+while IFS= read -r -d '' working_path; do
+  run_scan dir --redact=100 --no-banner --no-color --log-level=error -- "$working_path"
+done <"$path_inventory"
+
 rm -f -- "$scan_output"
 scan_output=""
+rm -f -- "$path_inventory"
+path_inventory=""
 printf 'secret-scan: passed\n'

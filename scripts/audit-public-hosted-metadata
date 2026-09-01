@@ -12,7 +12,13 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from public_boundary_policy import Finding, canonical_inventory_digest, scan_bytes
+sys.dont_write_bytecode = True
+
+from public_boundary_policy import (  # noqa: E402
+    Finding,
+    canonical_inventory_digest,
+    scan_bytes,
+)
 
 SURFACES = {
     "artifacts",

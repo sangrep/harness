@@ -1,0 +1,24 @@
+name: Feature or design proposal
+description: Propose public component behavior
+title: "proposal: "
+labels: ["type:capability"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Public problem
+      description: Describe the user or integrator outcome without private product context.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and compatibility
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Observable acceptance
+    validations:
+      required: true

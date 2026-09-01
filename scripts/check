@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required=(
+  README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md SUPPORT.md GOVERNANCE.md
+  AGENTS.md LICENSE NOTICE .github/CODEOWNERS .github/PULL_REQUEST_TEMPLATE.md
+  scripts/check scripts/check-gitleaks scripts/check-public-boundary scripts/audit-public-hosted-metadata
+  scripts/public_boundary_policy.py
+)
+
+for path in "${required[@]}"; do
+  if [[ ! -f "$path" ]]; then
+    printf 'repository-check: missing-required-file source=%s\n' "$path" >&2
+    exit 1
+  fi
+done
+
+if (( $(wc -l < AGENTS.md) >= 120 )); then
+  printf 'repository-check: root-agent-guide-over-budget\n' >&2
+  exit 1
+fi
+
+python3 -c 'import ast, pathlib, sys; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8"), filename=path) for path in sys.argv[1:]]' \
+  scripts/public_boundary_policy.py scripts/check-public-boundary \
+  scripts/audit-public-hosted-metadata
+./scripts/check-gitleaks
+PYTHONDONTWRITEBYTECODE=1 ./scripts/check-public-boundary
+printf 'repository-check: passed\n'

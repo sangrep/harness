@@ -1,0 +1,23 @@
+name: Documentation improvement
+description: Report one public documentation gap
+title: "docs: "
+labels: ["type:docs"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Public page or section
+    validations:
+      required: true
+  - type: textarea
+    id: gap
+    attributes:
+      label: What is unclear or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Expected reader outcome
+    validations:
+      required: true

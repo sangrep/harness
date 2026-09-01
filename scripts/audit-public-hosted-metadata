@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from public_boundary_policy import Finding, canonical_inventory_digest, scan_bytes
+
+SURFACES = {
+    "artifacts",
+    "attestations",
+    "branches",
+    "caches",
+    "commits",
+    "customProperties",
+    "deploymentStatuses",
+    "deployments",
+    "discussionComments",
+    "discussions",
+    "environments",
+    "issueComments",
+    "issues",
+    "labels",
+    "linkedAttachments",
+    "milestones",
+    "packages",
+    "pages",
+    "pullCommits",
+    "pullRequests",
+    "pullReviewComments",
+    "pullReviews",
+    "releaseAssets",
+    "releases",
+    "repository",
+    "rulesets",
+    "tags",
+    "workflowJobs",
+    "workflowLogs",
+    "workflowRuns",
+    "workflows",
+}
+COLLECTION_KEYS = {
+    "actions/artifacts": "artifacts",
+    "actions/caches": "actions_caches",
+    "actions/runs": "workflow_runs",
+    "actions/workflows": "workflows",
+    "environments": "environments",
+}
+ATTACHMENT_PATTERN = re.compile(r"https://github\.com/user-attachments/assets/[0-9A-Za-z-]+")
+CREDENTIAL_KEYS = {
+    "accesstoken",
+    "apikey",
+    "authtoken",
+    "clientsecret",
+    "clonetoken",
+    "password",
+    "privatekey",
+    "refresh_token",
+    "refreshtoken",
+    "secret",
+    "tempclonetoken",
+    "token",
+}
+
+
+class HostedAuditError(RuntimeError):
+    pass
+
+
+def _normalized_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", value.lower())
+
+
+def _safe_projection(value: Any) -> Any:
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for key, child in value.items():
+            normalized = _normalized_key(str(key))
+            if normalized in CREDENTIAL_KEYS:
+                continue
+            projected[str(key)] = _safe_projection(child)
+        return projected
+    if isinstance(value, list):
+        return [_safe_projection(item) for item in value]
+    return value
+
+
+def _gh(arguments: list[str], *, binary: bool = False, allow_absent: bool = False) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["gh", *arguments],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace")
+        if allow_absent and ("HTTP 404" in stderr or "HTTP 409" in stderr):
+            return b"" if binary else b"null"
+        raise HostedAuditError("GitHub hosted surface could not be inventoried") from error
+    return completed.stdout
+
+
+def _json(arguments: list[str], *, allow_absent: bool = False) -> Any:
+    raw = _gh(arguments, allow_absent=allow_absent)
+    try:
+        return _safe_projection(json.loads(raw))
+    except json.JSONDecodeError as error:
+        raise HostedAuditError("GitHub hosted surface returned malformed JSON") from error
+
+
+def _object(endpoint: str, *, allow_absent: bool = False) -> dict[str, Any] | None:
+    value = _json(["api", endpoint], allow_absent=allow_absent)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HostedAuditError("GitHub object surface returned the wrong shape")
+    return value
+
+
+def _list(endpoint: str, *, collection_key: str | None = None) -> list[dict[str, Any]]:
+    value = _json(["api", "--paginate", "--slurp", endpoint])
+    if not isinstance(value, list):
+        raise HostedAuditError("GitHub list surface returned the wrong shape")
+    rows: list[dict[str, Any]] = []
+    for page in value:
+        page_rows: Any = page
+        if collection_key is not None:
+            if not isinstance(page, dict) or not isinstance(page.get(collection_key), list):
+                raise HostedAuditError("GitHub collection surface returned the wrong shape")
+            page_rows = page[collection_key]
+        if not isinstance(page_rows, list) or not all(isinstance(item, dict) for item in page_rows):
+            raise HostedAuditError("GitHub list page returned the wrong shape")
+        rows.extend(page_rows)
+    return rows
+
+
+def _scan_zip(payload: bytes, *, source: str) -> tuple[list[Finding], dict[str, Any]]:
+    if len(payload) > 64 * 1024 * 1024:
+        raise HostedAuditError("hosted archive exceeds the audit download budget")
+    findings: list[Finding] = []
+    entries: list[dict[str, Any]] = []
+    with tempfile.TemporaryFile() as temporary:
+        temporary.write(payload)
+        temporary.seek(0)
+        try:
+            archive = zipfile.ZipFile(temporary)
+        except zipfile.BadZipFile as error:
+            raise HostedAuditError("hosted archive is not a valid ZIP") from error
+        total = 0
+        for info in archive.infolist():
+            path = PurePosixPath(info.filename)
+            if path.is_absolute() or ".." in path.parts or info.is_dir():
+                if not info.is_dir():
+                    raise HostedAuditError("hosted archive contains an unsafe path")
+                continue
+            total += info.file_size
+            if total > 128 * 1024 * 1024:
+                raise HostedAuditError("expanded hosted archive exceeds the audit budget")
+            data = archive.read(info)
+            entry_source = f"{source}:{info.filename}"
+            findings.extend(
+                scan_bytes(
+                    data,
+                    source=entry_source,
+                    suffix=Path(info.filename).suffix,
+                )
+            )
+            entries.append(
+                {
+                    "pathDigest": hashlib.sha256(info.filename.encode("utf-8")).hexdigest(),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data),
+                }
+            )
+    return findings, {"sha256": hashlib.sha256(payload).hexdigest(), "entries": entries}
+
+
+def _collect_discussions(
+    owner: str, name: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    query = (
+        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+        "discussions(first:100){pageInfo{hasNextPage}nodes{"
+        "id number title body url comments(first:100){"
+        "pageInfo{hasNextPage}nodes{id body url}}}}}}}"
+    )
+    value = _json(
+        [
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+        ]
+    )
+    try:
+        discussions = value["data"]["repository"]["discussions"]
+    except (KeyError, TypeError) as error:
+        raise HostedAuditError("discussion inventory returned the wrong shape") from error
+    if discussions["pageInfo"]["hasNextPage"]:
+        raise HostedAuditError("discussion inventory was truncated")
+    records: list[dict[str, Any]] = []
+    comments: list[dict[str, Any]] = []
+    for discussion in discussions["nodes"]:
+        discussion_comments = discussion.pop("comments")
+        if discussion_comments["pageInfo"]["hasNextPage"]:
+            raise HostedAuditError("discussion comment inventory was truncated")
+        comments.extend(discussion_comments["nodes"])
+        records.append(discussion)
+    return records, comments
+
+
+def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Finding]]:
+    if repository.count("/") != 1:
+        raise HostedAuditError("repository must use owner/name form")
+    owner, name = repository.split("/", maxsplit=1)
+    prefix = f"repos/{owner}/{name}"
+    repo = _object(prefix)
+    if repo is None or repo.get("full_name") != repository or repo.get("private") is not True:
+        raise HostedAuditError("hosted audit requires the exact private pre-publication repository")
+
+    surfaces: dict[str, list[Any]] = {surface: [] for surface in SURFACES}
+    findings: list[Finding] = []
+    surfaces["repository"] = [repo]
+    surfaces["branches"] = _list(f"{prefix}/branches?per_page=100")
+    surfaces["tags"] = _list(f"{prefix}/tags?per_page=100")
+    surfaces["commits"] = _list(f"{prefix}/commits?per_page=100")
+    surfaces["issues"] = _list(f"{prefix}/issues?state=all&per_page=100")
+    surfaces["issueComments"] = _list(f"{prefix}/issues/comments?per_page=100")
+    surfaces["labels"] = _list(f"{prefix}/labels?per_page=100")
+    surfaces["milestones"] = _list(f"{prefix}/milestones?state=all&per_page=100")
+    surfaces["pullRequests"] = _list(f"{prefix}/pulls?state=all&per_page=100")
+    surfaces["pullReviewComments"] = _list(f"{prefix}/pulls/comments?per_page=100")
+    surfaces["rulesets"] = _list(f"{prefix}/rulesets?includes_parents=true&per_page=100")
+
+    discussions, discussion_comments = _collect_discussions(owner, name)
+    surfaces["discussions"] = discussions
+    surfaces["discussionComments"] = discussion_comments
+
+    for pull in surfaces["pullRequests"]:
+        number = pull.get("number")
+        if not isinstance(number, int):
+            raise HostedAuditError("pull request inventory omitted its number")
+        surfaces["pullReviews"].extend(_list(f"{prefix}/pulls/{number}/reviews?per_page=100"))
+        surfaces["pullCommits"].extend(_list(f"{prefix}/pulls/{number}/commits?per_page=100"))
+
+    surfaces["workflows"] = _list(
+        f"{prefix}/actions/workflows?per_page=100", collection_key="workflows"
+    )
+    surfaces["workflowRuns"] = _list(
+        f"{prefix}/actions/runs?per_page=100", collection_key="workflow_runs"
+    )
+    for run in surfaces["workflowRuns"]:
+        run_id = run.get("id")
+        if not isinstance(run_id, int):
+            raise HostedAuditError("workflow run inventory omitted its id")
+        jobs = _object(f"{prefix}/actions/runs/{run_id}/jobs?per_page=100")
+        if jobs is None or not isinstance(jobs.get("jobs"), list):
+            raise HostedAuditError("workflow job inventory returned the wrong shape")
+        surfaces["workflowJobs"].extend(jobs["jobs"])
+        log_payload = _gh(["api", f"{prefix}/actions/runs/{run_id}/logs"], binary=True)
+        log_findings, log_receipt = _scan_zip(log_payload, source=f"workflow-log:{run_id}")
+        findings.extend(log_findings)
+        surfaces["workflowLogs"].append({"runId": run_id, **log_receipt})
+
+    surfaces["artifacts"] = _list(
+        f"{prefix}/actions/artifacts?per_page=100", collection_key="artifacts"
+    )
+    for artifact in surfaces["artifacts"]:
+        artifact_id = artifact.get("id")
+        if not isinstance(artifact_id, int):
+            raise HostedAuditError("artifact inventory omitted its id")
+        payload = _gh(["api", f"{prefix}/actions/artifacts/{artifact_id}/zip"], binary=True)
+        artifact_findings, receipt = _scan_zip(payload, source=f"artifact:{artifact_id}")
+        findings.extend(artifact_findings)
+        artifact["contentReceipt"] = receipt
+
+    surfaces["caches"] = _list(
+        f"{prefix}/actions/caches?per_page=100", collection_key="actions_caches"
+    )
+    surfaces["releases"] = _list(f"{prefix}/releases?per_page=100")
+    for release in surfaces["releases"]:
+        assets = release.get("assets", [])
+        if not isinstance(assets, list):
+            raise HostedAuditError("release assets returned the wrong shape")
+        surfaces["releaseAssets"].extend(assets)
+    surfaces["deployments"] = _list(f"{prefix}/deployments?per_page=100")
+    for deployment in surfaces["deployments"]:
+        deployment_id = deployment.get("id")
+        if not isinstance(deployment_id, int):
+            raise HostedAuditError("deployment inventory omitted its id")
+        surfaces["deploymentStatuses"].extend(
+            _list(f"{prefix}/deployments/{deployment_id}/statuses?per_page=100")
+        )
+    environments = _object(f"{prefix}/environments?per_page=100", allow_absent=True)
+    if environments is not None:
+        rows = environments.get("environments")
+        if not isinstance(rows, list):
+            raise HostedAuditError("environment inventory returned the wrong shape")
+        surfaces["environments"] = rows
+    pages = _object(f"{prefix}/pages", allow_absent=True)
+    if pages is not None:
+        surfaces["pages"] = [pages]
+    custom = _json(["api", f"{prefix}/properties/values"], allow_absent=True)
+    if custom is not None:
+        if not isinstance(custom, list):
+            raise HostedAuditError("custom-property inventory returned the wrong shape")
+        surfaces["customProperties"] = custom
+
+    for package_type in ("container", "maven", "npm", "nuget", "rubygems"):
+        packages = _json(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                f"orgs/{owner}/packages?package_type={package_type}&per_page=100",
+            ],
+            allow_absent=True,
+        )
+        if packages is None:
+            continue
+        if not isinstance(packages, list):
+            raise HostedAuditError("package inventory returned the wrong shape")
+        for page in packages:
+            if not isinstance(page, list):
+                raise HostedAuditError("package inventory page returned the wrong shape")
+            for package in page:
+                package_repository = (package.get("repository") or {}).get("full_name")
+                if package_repository == repository:
+                    surfaces["packages"].append(package)
+
+    text_records = surfaces["issues"] + surfaces["issueComments"] + surfaces["pullRequests"]
+    attachment_urls: set[str] = set()
+    for record in text_records:
+        for field in ("body", "description"):
+            value = record.get(field)
+            if isinstance(value, str):
+                attachment_urls.update(ATTACHMENT_PATTERN.findall(value))
+    if attachment_urls:
+        raise HostedAuditError("linked attachment content is not yet scan-complete")
+
+    if surfaces["artifacts"] or surfaces["releaseAssets"] or surfaces["packages"]:
+        raise HostedAuditError("attestation inventory is not derivable for hosted artifacts")
+    inventory = {"repository": repository, "surfaces": surfaces}
+    return inventory, findings
+
+
+def validate_inventory(inventory: dict[str, Any], *, repository: str) -> None:
+    if set(inventory) != {"repository", "surfaces"}:
+        raise HostedAuditError("inventory has unknown or missing top-level fields")
+    if inventory["repository"] != repository:
+        raise HostedAuditError("inventory repository does not match the requested repository")
+    surfaces = inventory["surfaces"]
+    if not isinstance(surfaces, dict):
+        raise HostedAuditError("inventory surfaces must be a mapping")
+    unknown = set(surfaces) - SURFACES
+    if unknown:
+        raise HostedAuditError("unrecognized-hosted-surface")
+    missing = SURFACES - set(surfaces)
+    if missing:
+        raise HostedAuditError("hosted-surface-inventory-incomplete")
+    if not all(isinstance(records, list) for records in surfaces.values()):
+        raise HostedAuditError("hosted surface records must be lists")
+
+
+def scan_inventory(inventory: dict[str, Any], initial: list[Finding]) -> list[Finding]:
+    findings = list(initial)
+    for surface, records in inventory["surfaces"].items():
+        for index, record in enumerate(records):
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            findings.extend(scan_bytes(payload, source=f"hosted:{surface}:{index}"))
+    return findings
+
+
+def _write_receipt(path: Path, inventory: dict[str, Any]) -> None:
+    counts = {name: len(records) for name, records in inventory["surfaces"].items()}
+    receipt = {
+        "repository": inventory["repository"],
+        "surfaceCounts": counts,
+        "inventoryDigest": canonical_inventory_digest(inventory),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fail-closed hosted public-metadata preflight.")
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--inventory-file", type=Path)
+    parser.add_argument("--digest-output", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        if args.inventory_file is None:
+            inventory, initial_findings = collect_live_inventory(args.repository)
+        else:
+            inventory = json.loads(args.inventory_file.read_text(encoding="utf-8"))
+            if not isinstance(inventory, dict):
+                raise HostedAuditError("inventory must be a JSON object")
+            initial_findings = []
+        validate_inventory(inventory, repository=args.repository)
+        findings = sorted(set(scan_inventory(inventory, initial_findings)))
+        if findings:
+            for finding in findings:
+                print(f"hosted-metadata: blocked {finding.render()}", file=sys.stderr)
+            return 1
+        _write_receipt(args.digest_output, inventory)
+    except (HostedAuditError, OSError, json.JSONDecodeError) as error:
+        category = str(error)
+        allowed = {
+            "unrecognized-hosted-surface",
+            "hosted-surface-inventory-incomplete",
+        }
+        if category not in allowed:
+            category = "hosted-inventory-incomplete"
+        print(f"hosted-metadata: blocked category={category}", file=sys.stderr)
+        return 1
+    total = sum(len(records) for records in inventory["surfaces"].values())
+    print(f"hosted-metadata: passed surfaces={len(SURFACES)} records={total}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

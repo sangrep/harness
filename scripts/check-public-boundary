@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from public_boundary_policy import Finding, scan_bytes, scan_path
+
+ROOT = Path.cwd()
+POLICY_PATH = "scripts/public_boundary_policy.py"
+
+
+def _git_bytes(arguments: list[str]) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return b""
+    return completed.stdout
+
+
+def _tracked_paths() -> list[str]:
+    payload = _git_bytes(["ls-files", "-z"])
+    paths = [part.decode("utf-8", errors="strict") for part in payload.split(b"\0") if part]
+    if not paths:
+        raise RuntimeError("no tracked files were available for the public-boundary scan")
+    for value in paths:
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise RuntimeError("tracked path escaped the repository boundary")
+    return paths
+
+
+def collect_findings() -> list[Finding]:
+    findings: list[Finding] = []
+    branch = _git_bytes(["branch", "--show-current"])
+    findings.extend(scan_bytes(branch, source="git-branch"))
+    messages = _git_bytes(["log", "--format=%B"])
+    findings.extend(scan_bytes(messages, source="git-commit-messages"))
+
+    for relative in _tracked_paths():
+        include_restricted = relative != POLICY_PATH
+        findings.extend(
+            scan_path(
+                ROOT / relative,
+                source=f"tracked-file:{relative}",
+                include_restricted=include_restricted,
+            )
+        )
+
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path:
+        findings.extend(scan_path(Path(event_path), source="github-event"))
+    pr_text_path = os.environ.get("PUBLIC_BOUNDARY_PR_TEXT_FILE")
+    if pr_text_path:
+        findings.extend(scan_path(Path(pr_text_path), source="pull-request-text"))
+    return findings
+
+
+def main() -> int:
+    try:
+        findings = collect_findings()
+    except (OSError, RuntimeError, UnicodeDecodeError):
+        print("public-boundary: blocked category=scan-incomplete", file=sys.stderr)
+        return 1
+    unique = sorted(set(findings))
+    if unique:
+        for finding in unique:
+            print(f"public-boundary: blocked {finding.render()}", file=sys.stderr)
+        return 1
+    print("public-boundary: passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

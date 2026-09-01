@@ -6,6 +6,7 @@ temporary_root=""
 gitleaks_binary=""
 scan_output=""
 path_inventory=""
+inventory_output=""
 asset=""
 expected_archive_sha=""
 expected_binary_sha=""
@@ -19,6 +20,9 @@ cleanup() {
   fi
   if [[ -n "$path_inventory" && -f "$path_inventory" ]]; then
     rm -f -- "$path_inventory"
+  fi
+  if [[ -n "$inventory_output" && -f "$inventory_output" ]]; then
+    rm -f -- "$inventory_output"
   fi
 }
 trap cleanup EXIT
@@ -177,13 +181,15 @@ history_arguments+=(.)
 run_scan "${history_arguments[@]}"
 
 path_inventory=$(mktemp "${TMPDIR:-/tmp}/sangrep-gitleaks-paths.XXXXXX")
-if ! git diff --name-only --diff-filter=ACMR -z >"$path_inventory"; then
+inventory_output=$(mktemp "${TMPDIR:-/tmp}/sangrep-gitleaks-inventory-output.XXXXXX")
+if ! git diff --name-only --diff-filter=ACMR -z >"$path_inventory" 2>"$inventory_output"; then
   blocked working-output-inventory-failed
 fi
-if ! git ls-files --others --exclude-standard -z >>"$path_inventory"; then
+if ! git ls-files --others --exclude-standard -z >>"$path_inventory" 2>"$inventory_output"; then
   blocked working-output-inventory-failed
 fi
-if ! generated_roots=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts python3 - <<'PY'
+if ! generated_roots=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts python3 - \
+  2>"$inventory_output" <<'PY'
 from public_boundary_policy import GENERATED_OUTPUT_ROOTS
 
 print("\n".join(GENERATED_OUTPUT_ROOTS))
@@ -194,7 +200,8 @@ fi
 while IFS= read -r generated_root; do
   [[ -n "$generated_root" ]] || continue
   if [[ -e "$generated_root" || -L "$generated_root" ]]; then
-    if ! find "$generated_root" \( -type f -o -type l \) -print0 >>"$path_inventory"; then
+    if ! find "$generated_root" \( -type f -o -type l \) -print0 \
+      >>"$path_inventory" 2>"$inventory_output"; then
       blocked working-output-inventory-failed
     fi
   fi
@@ -207,4 +214,6 @@ rm -f -- "$scan_output"
 scan_output=""
 rm -f -- "$path_inventory"
 path_inventory=""
+rm -f -- "$inventory_output"
+inventory_output=""
 printf 'secret-scan: passed\n'

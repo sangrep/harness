@@ -123,7 +123,17 @@ RESTRICTED_RULES = (
     ),
     (
         "custody-selector",
-        re.compile(r"\b(?:custody selector|keychain selector|signing selector)\b", re.I),
+        re.compile(
+            r"\b(?:custody selector|keychain selector|signing selector)\b|"
+            r"\b(?:macos[-_]?keychain|keychain|windows[-_]?credential[-_]?manager|"
+            r"sangrep[-_]?(?:custody|signing|pack[-_]?signing)[a-z0-9+.-]*):/{1,3}"
+            r"[^\s\"'<>]+|"
+            r"\b[a-z][a-z0-9+.-]*(?:keychain|credential[-_]?manager)[a-z0-9+.-]*:/{1,3}"
+            r"[^\s\"'<>]+|"
+            r"\b[a-z][a-z0-9+.-]*:/{1,3}[^\s\"'<>]*(?:keychain|"
+            r"credential[-_]?manager)[^\s\"'<>]*",
+            re.I,
+        ),
     ),
 )
 
@@ -148,6 +158,48 @@ def scan_text(text: str, *, source: str, include_restricted: bool = True) -> lis
     return findings
 
 
+def _valid_media(data: bytes, suffix: str) -> bool:
+    if suffix == ".gif":
+        return (
+            len(data) >= 13
+            and data[:6] in {b"GIF87a", b"GIF89a"}
+            and int.from_bytes(data[6:8], "little") > 0
+            and int.from_bytes(data[8:10], "little") > 0
+        )
+    if suffix == ".ico":
+        return (
+            len(data) >= 6
+            and data[:4] == b"\x00\x00\x01\x00"
+            and int.from_bytes(data[4:6], "little") > 0
+        )
+    if suffix in {".jpeg", ".jpg"}:
+        return len(data) >= 4 and data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9")
+    if suffix == ".mp4":
+        if len(data) < 12 or data[4:8] != b"ftyp":
+            return False
+        first_box_bytes = int.from_bytes(data[:4], "big")
+        return 8 <= first_box_bytes <= len(data)
+    if suffix == ".png":
+        return (
+            len(data) >= 45
+            and data.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+            and int.from_bytes(data[16:20], "big") > 0
+            and int.from_bytes(data[20:24], "big") > 0
+            and data[-12:-8] == b"\x00\x00\x00\x00"
+            and data[-8:-4] == b"IEND"
+        )
+    if suffix == ".webm":
+        return len(data) >= 4 and data.startswith(b"\x1aE\xdf\xa3")
+    if suffix == ".webp":
+        return (
+            len(data) >= 12
+            and data[:4] == b"RIFF"
+            and data[8:12] == b"WEBP"
+            and int.from_bytes(data[4:8], "little") + 8 == len(data)
+        )
+    return False
+
+
 def scan_bytes(
     data: bytes,
     *,
@@ -161,10 +213,17 @@ def scan_bytes(
         return [Finding(category="file-over-size-budget", record_id=record_id)]
     if normalized_suffix in PROHIBITED_SUFFIXES:
         return [Finding(category="prohibited-file-type", record_id=record_id)]
-    if b"\x00" in data or normalized_suffix in ALLOWED_BINARY_SUFFIXES:
-        if normalized_suffix not in ALLOWED_BINARY_SUFFIXES:
-            return [Finding(category="unrecognized-binary", record_id=record_id)]
-        return []
+    if normalized_suffix in ALLOWED_BINARY_SUFFIXES:
+        findings = scan_text(
+            data.decode("utf-8", errors="ignore"),
+            source=source,
+            include_restricted=include_restricted,
+        )
+        if not _valid_media(data, normalized_suffix):
+            findings.append(Finding(category="invalid-media", record_id=record_id))
+        return findings
+    if b"\x00" in data:
+        return [Finding(category="unrecognized-binary", record_id=record_id)]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:

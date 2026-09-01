@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -60,7 +62,11 @@ COLLECTION_KEYS = {
     "actions/workflows": "workflows",
     "environments": "environments",
 }
-ATTACHMENT_PATTERN = re.compile(r"https://github\.com/user-attachments/assets/[0-9A-Za-z-]+")
+ATTACHMENT_PATTERN = re.compile(
+    r"https://(?:github\.com/user-attachments/assets/[0-9A-Za-z-]+|"
+    r"user-images\.githubusercontent\.com/[^\s\"'<>]+)"
+)
+SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
 CREDENTIAL_KEYS = {
     "accesstoken",
     "apikey",
@@ -97,6 +103,19 @@ def _safe_projection(value: Any) -> Any:
     if isinstance(value, list):
         return [_safe_projection(item) for item in value]
     return value
+
+
+def _linked_attachment_urls(value: Any) -> set[str]:
+    urls: set[str] = set()
+    if isinstance(value, dict):
+        for child in value.values():
+            urls.update(_linked_attachment_urls(child))
+    elif isinstance(value, list):
+        for child in value:
+            urls.update(_linked_attachment_urls(child))
+    elif isinstance(value, str):
+        urls.update(ATTACHMENT_PATTERN.findall(value))
+    return urls
 
 
 def _gh(arguments: list[str], *, binary: bool = False, allow_absent: bool = False) -> bytes:
@@ -346,16 +365,6 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
                 if package_repository == repository:
                     surfaces["packages"].append(package)
 
-    text_records = surfaces["issues"] + surfaces["issueComments"] + surfaces["pullRequests"]
-    attachment_urls: set[str] = set()
-    for record in text_records:
-        for field in ("body", "description"):
-            value = record.get(field)
-            if isinstance(value, str):
-                attachment_urls.update(ATTACHMENT_PATTERN.findall(value))
-    if attachment_urls:
-        raise HostedAuditError("linked attachment content is not yet scan-complete")
-
     if surfaces["artifacts"] or surfaces["releaseAssets"] or surfaces["packages"]:
         raise HostedAuditError("attestation inventory is not derivable for hosted artifacts")
     inventory = {"repository": repository, "surfaces": surfaces}
@@ -378,6 +387,8 @@ def validate_inventory(inventory: dict[str, Any], *, repository: str) -> None:
         raise HostedAuditError("hosted-surface-inventory-incomplete")
     if not all(isinstance(records, list) for records in surfaces.values()):
         raise HostedAuditError("hosted surface records must be lists")
+    if _linked_attachment_urls(surfaces):
+        raise HostedAuditError("linked attachment content is not yet scan-complete")
 
 
 def scan_inventory(inventory: dict[str, Any], initial: list[Finding]) -> list[Finding]:
@@ -389,13 +400,40 @@ def scan_inventory(inventory: dict[str, Any], initial: list[Finding]) -> list[Fi
     return findings
 
 
-def _write_receipt(path: Path, inventory: dict[str, Any]) -> None:
+def _live_receipt(inventory: dict[str, Any], *, collected_at: str) -> dict[str, Any]:
+    repository_records = inventory["surfaces"]["repository"]
+    if len(repository_records) != 1 or not isinstance(repository_records[0], dict):
+        raise HostedAuditError("live inventory omitted the repository authority")
+    repository_record = repository_records[0]
+    if repository_record.get("full_name") != inventory["repository"]:
+        raise HostedAuditError("live inventory repository authority did not match")
+    default_branch = repository_record.get("default_branch")
+    if not isinstance(default_branch, str) or not default_branch:
+        raise HostedAuditError("live inventory omitted the default branch")
+    matching_branches = [
+        branch
+        for branch in inventory["surfaces"]["branches"]
+        if isinstance(branch, dict) and branch.get("name") == default_branch
+    ]
+    if len(matching_branches) != 1:
+        raise HostedAuditError("live inventory omitted the default branch head")
+    default_head = (matching_branches[0].get("commit") or {}).get("sha")
+    if not isinstance(default_head, str) or not SHA_PATTERN.fullmatch(default_head):
+        raise HostedAuditError("live inventory default branch head was invalid")
     counts = {name: len(records) for name, records in inventory["surfaces"].items()}
-    receipt = {
+    return {
+        "schemaVersion": "sangrep.hosted-publication-receipt.live.v1",
+        "authority": "live-github-inventory",
         "repository": inventory["repository"],
+        "defaultBranch": default_branch,
+        "defaultHead": default_head,
+        "collectedAt": collected_at,
         "surfaceCounts": counts,
         "inventoryDigest": canonical_inventory_digest(inventory),
     }
+
+
+def _write_receipt(path: Path, receipt: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o600)
@@ -407,10 +445,15 @@ def main() -> int:
     parser.add_argument("--inventory-file", type=Path)
     parser.add_argument("--digest-output", type=Path, required=True)
     args = parser.parse_args()
+    fixture_mode = args.inventory_file is not None
     try:
-        if args.inventory_file is None:
+        if not fixture_mode:
             inventory, initial_findings = collect_live_inventory(args.repository)
         else:
+            if os.environ.get("SANGREP_HOSTED_AUDIT_TEST_MODE") != "true" or not os.environ.get(
+                "PYTEST_CURRENT_TEST"
+            ):
+                raise HostedAuditError("fixture-mode-forbidden")
             inventory = json.loads(args.inventory_file.read_text(encoding="utf-8"))
             if not isinstance(inventory, dict):
                 raise HostedAuditError("inventory must be a JSON object")
@@ -421,10 +464,16 @@ def main() -> int:
             for finding in findings:
                 print(f"hosted-metadata: blocked {finding.render()}", file=sys.stderr)
             return 1
-        _write_receipt(args.digest_output, inventory)
+        total = sum(len(records) for records in inventory["surfaces"].values())
+        if fixture_mode:
+            print(f"hosted-metadata: fixture-passed surfaces={len(SURFACES)} records={total}")
+            return 0
+        collected_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        _write_receipt(args.digest_output, _live_receipt(inventory, collected_at=collected_at))
     except (HostedAuditError, OSError, json.JSONDecodeError) as error:
         category = str(error)
         allowed = {
+            "fixture-mode-forbidden",
             "unrecognized-hosted-surface",
             "hosted-surface-inventory-incomplete",
         }
@@ -432,7 +481,6 @@ def main() -> int:
             category = "hosted-inventory-incomplete"
         print(f"hosted-metadata: blocked category={category}", file=sys.stderr)
         return 1
-    total = sum(len(records) for records in inventory["surfaces"].values())
     print(f"hosted-metadata: passed surfaces={len(SURFACES)} records={total}")
     return 0
 

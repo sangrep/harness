@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import NamedTuple
 
 MAX_SCANNED_BYTES = 8 * 1024 * 1024
+GENERATED_OUTPUT_ROOTS = (
+    "artifacts",
+    "build",
+    "coverage",
+    "dist",
+    "generated",
+    "out",
+    "reports",
+)
 ALLOWED_BINARY_SUFFIXES = {
     ".gif",
     ".ico",
@@ -42,6 +52,40 @@ class Finding(NamedTuple):
 
 def opaque_record_id(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+
+def generated_output_paths(repository_root: Path = Path(".")) -> tuple[str, ...]:
+    paths: set[str] = set()
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for root_name in GENERATED_OUTPUT_ROOTS:
+        root = repository_root / root_name
+        if root.is_symlink() or root.is_file():
+            paths.add(root.relative_to(repository_root).as_posix())
+            continue
+        if not root.exists():
+            continue
+        if not root.is_dir():
+            paths.add(root.relative_to(repository_root).as_posix())
+            continue
+        for directory, directory_names, file_names in os.walk(
+            root,
+            topdown=True,
+            onerror=fail,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            for name in tuple(directory_names):
+                child = directory_path / name
+                if child.is_symlink():
+                    paths.add(child.relative_to(repository_root).as_posix())
+                    directory_names.remove(name)
+            for name in file_names:
+                child = directory_path / name
+                paths.add(child.relative_to(repository_root).as_posix())
+    return tuple(sorted(paths))
 
 
 RESTRICTED_RULES = (

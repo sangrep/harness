@@ -183,6 +183,22 @@ fi
 if ! git ls-files --others --exclude-standard -z >>"$path_inventory"; then
   blocked working-output-inventory-failed
 fi
+if ! generated_roots=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts python3 - <<'PY'
+from public_boundary_policy import GENERATED_OUTPUT_ROOTS
+
+print("\n".join(GENERATED_OUTPUT_ROOTS))
+PY
+); then
+  blocked working-output-inventory-failed
+fi
+while IFS= read -r generated_root; do
+  [[ -n "$generated_root" ]] || continue
+  if [[ -e "$generated_root" || -L "$generated_root" ]]; then
+    if ! find "$generated_root" \( -type f -o -type l \) -print0 >>"$path_inventory"; then
+      blocked working-output-inventory-failed
+    fi
+  fi
+done <<<"$generated_roots"
 while IFS= read -r -d '' working_path; do
   run_scan dir --redact=100 --no-banner --no-color --log-level=error -- "$working_path"
 done <"$path_inventory"

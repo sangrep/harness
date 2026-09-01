@@ -11,7 +11,13 @@ from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 
-from public_boundary_policy import Finding, opaque_record_id, scan_bytes, scan_path  # noqa: E402
+from public_boundary_policy import (  # noqa: E402
+    Finding,
+    generated_output_paths,
+    opaque_record_id,
+    scan_bytes,
+    scan_path,
+)
 
 POLICY_PATH = "scripts/public_boundary_policy.py"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -113,11 +119,10 @@ def _scan_index() -> list[Finding]:
 def _scan_working_outputs() -> list[Finding]:
     tracked = _git_bytes(["diff", "--name-only", "--diff-filter=ACMR", "-z"])
     untracked = _git_bytes(["ls-files", "--others", "--exclude-standard", "-z"])
-    paths = sorted(
-        {_safe_path(raw) for raw in [*tracked.split(b"\0"), *untracked.split(b"\0")] if raw}
-    )
+    paths = {_safe_path(raw) for raw in [*tracked.split(b"\0"), *untracked.split(b"\0")] if raw}
+    paths.update(generated_output_paths())
     findings: list[Finding] = []
-    for path in paths:
+    for path in sorted(paths):
         findings.extend(
             scan_path(
                 Path(path),

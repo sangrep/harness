@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
-from public_boundary_policy import Finding, scan_bytes, scan_path
+from public_boundary_policy import Finding, opaque_record_id, scan_bytes, scan_path
 
-ROOT = Path.cwd()
 POLICY_PATH = "scripts/public_boundary_policy.py"
+SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
+REGULAR_MODES = {"100644", "100755"}
+
+
+class ScanContext(NamedTuple):
+    branch: bytes
+    base_sha: str | None
+    head_sha: str | None
+    event_path: Path | None
 
 
 def _git_bytes(arguments: list[str]) -> bytes:
@@ -19,43 +30,176 @@ def _git_bytes(arguments: list[str]) -> bytes:
             check=True,
             capture_output=True,
         )
-    except subprocess.CalledProcessError:
-        return b""
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("required git evidence was unavailable") from error
     return completed.stdout
 
 
-def _tracked_paths() -> list[str]:
-    payload = _git_bytes(["ls-files", "-z"])
-    paths = [part.decode("utf-8", errors="strict") for part in payload.split(b"\0") if part]
-    if not paths:
-        raise RuntimeError("no tracked files were available for the public-boundary scan")
-    for value in paths:
-        path = Path(value)
-        if path.is_absolute() or ".." in path.parts:
-            raise RuntimeError("tracked path escaped the repository boundary")
-    return paths
+def _safe_path(raw: bytes) -> str:
+    value = raw.decode("utf-8", errors="strict")
+    path = Path(value)
+    if not value or path.is_absolute() or ".." in path.parts:
+        raise RuntimeError("git path escaped the repository boundary")
+    return value
+
+
+def _parse_tree_entry(payload: bytes, *, expected_path: str) -> tuple[str, str]:
+    records = [record for record in payload.split(b"\0") if record]
+    if len(records) != 1 or b"\t" not in records[0]:
+        raise RuntimeError("git tree entry was malformed")
+    metadata, raw_path = records[0].split(b"\t", maxsplit=1)
+    parts = metadata.decode("ascii", errors="strict").split()
+    path = _safe_path(raw_path)
+    if len(parts) != 3 or path != expected_path:
+        raise RuntimeError("git tree entry did not match its requested path")
+    mode, object_type, object_id = parts
+    if object_type != "blob":
+        raise RuntimeError("git tree entry was not a blob")
+    return mode, object_id
+
+
+def _scan_blob(
+    *,
+    mode: str,
+    object_id: str,
+    path: str,
+    source: str,
+) -> list[Finding]:
+    if mode == "120000":
+        return [Finding(category="symlink", record_id=opaque_record_id(source))]
+    if mode not in REGULAR_MODES:
+        return [Finding(category="unrecognized-git-mode", record_id=opaque_record_id(source))]
+    data = _git_bytes(["cat-file", "blob", object_id])
+    path_findings = scan_bytes(path.encode("utf-8"), source=f"{source}:path")
+    content_findings = scan_bytes(
+        data,
+        source=source,
+        suffix=Path(path).suffix,
+        include_restricted=path != POLICY_PATH,
+    )
+    return [*path_findings, *content_findings]
+
+
+def _scan_index() -> list[Finding]:
+    payload = _git_bytes(["ls-files", "--stage", "-z"])
+    records = [record for record in payload.split(b"\0") if record]
+    if not records:
+        raise RuntimeError("no indexed files were available for the public-boundary scan")
+    findings: list[Finding] = []
+    for record in records:
+        if b"\t" not in record:
+            raise RuntimeError("git index entry was malformed")
+        metadata, raw_path = record.split(b"\t", maxsplit=1)
+        parts = metadata.decode("ascii", errors="strict").split()
+        if len(parts) != 3:
+            raise RuntimeError("git index metadata was malformed")
+        mode, object_id, stage = parts
+        if stage != "0":
+            raise RuntimeError("git index contains an unresolved entry")
+        path = _safe_path(raw_path)
+        findings.extend(
+            _scan_blob(
+                mode=mode,
+                object_id=object_id,
+                path=path,
+                source=f"indexed-file:{path}",
+            )
+        )
+    return findings
+
+
+def _load_context() -> ScanContext:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        branch = _git_bytes(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+        if not branch:
+            raise RuntimeError("local branch identity was unavailable")
+        return ScanContext(branch=branch, base_sha=None, head_sha=None, event_path=None)
+
+    event_name = os.environ.get("GITHUB_EVENT_NAME")
+    event_path_text = os.environ.get("GITHUB_EVENT_PATH")
+    if event_name not in {"pull_request", "push"} or not event_path_text:
+        raise RuntimeError("GitHub event context was incomplete")
+    event_path = Path(event_path_text)
+    try:
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        if event_name == "pull_request":
+            pull_request = event["pull_request"]
+            base_sha = pull_request["base"]["sha"]
+            head_sha = pull_request["head"]["sha"]
+            branch_text = pull_request["head"]["ref"]
+        else:
+            base_sha = event["before"]
+            head_sha = event["after"]
+            branch_text = event["ref"]
+    except (KeyError, OSError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("GitHub event context was malformed") from error
+    if not all(isinstance(value, str) for value in (base_sha, head_sha, branch_text)):
+        raise RuntimeError("GitHub event identities were malformed")
+    if not SHA_PATTERN.fullmatch(base_sha) or not SHA_PATTERN.fullmatch(head_sha):
+        raise RuntimeError("GitHub event commit identities were malformed")
+    if set(base_sha) == {"0"}:
+        raise RuntimeError("GitHub event base commit was unavailable")
+    _git_bytes(["cat-file", "-e", f"{base_sha}^{{commit}}"])
+    _git_bytes(["cat-file", "-e", f"{head_sha}^{{commit}}"])
+    return ScanContext(
+        branch=branch_text.encode("utf-8"),
+        base_sha=base_sha,
+        head_sha=head_sha,
+        event_path=event_path,
+    )
+
+
+def _range_paths(commit: str) -> list[str]:
+    payload = _git_bytes(
+        [
+            "diff-tree",
+            "-m",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-r",
+            "-z",
+            commit,
+        ]
+    )
+    return sorted({_safe_path(raw) for raw in payload.split(b"\0") if raw})
+
+
+def _scan_range(base_sha: str, head_sha: str) -> list[Finding]:
+    commit_payload = _git_bytes(["rev-list", "--reverse", f"{base_sha}..{head_sha}"])
+    commits = [value for value in commit_payload.decode("ascii").splitlines() if value]
+    findings: list[Finding] = []
+    for commit in commits:
+        if not SHA_PATTERN.fullmatch(commit):
+            raise RuntimeError("git range contained an invalid commit identity")
+        message = _git_bytes(["show", "-s", "--format=%B", commit])
+        findings.extend(scan_bytes(message, source=f"commit-message:{commit}"))
+        for path in _range_paths(commit):
+            entry = _git_bytes(["--literal-pathspecs", "ls-tree", "-z", commit, "--", path])
+            mode, object_id = _parse_tree_entry(entry, expected_path=path)
+            findings.extend(
+                _scan_blob(
+                    mode=mode,
+                    object_id=object_id,
+                    path=path,
+                    source=f"commit-file:{commit}:{path}",
+                )
+            )
+    return findings
 
 
 def collect_findings() -> list[Finding]:
-    findings: list[Finding] = []
-    branch = _git_bytes(["branch", "--show-current"])
-    findings.extend(scan_bytes(branch, source="git-branch"))
-    messages = _git_bytes(["log", "--format=%B"])
-    findings.extend(scan_bytes(messages, source="git-commit-messages"))
-
-    for relative in _tracked_paths():
-        include_restricted = relative != POLICY_PATH
-        findings.extend(
-            scan_path(
-                ROOT / relative,
-                source=f"tracked-file:{relative}",
-                include_restricted=include_restricted,
-            )
-        )
-
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if event_path:
-        findings.extend(scan_path(Path(event_path), source="github-event"))
+    context = _load_context()
+    findings = scan_bytes(context.branch, source="git-branch")
+    findings.extend(_scan_index())
+    if context.base_sha is not None and context.head_sha is not None:
+        findings.extend(_scan_range(context.base_sha, context.head_sha))
+    else:
+        message = _git_bytes(["show", "-s", "--format=%B", "HEAD"])
+        findings.extend(scan_bytes(message, source="head-commit-message"))
+    if context.event_path is not None:
+        findings.extend(scan_path(context.event_path, source="github-event"))
     pr_text_path = os.environ.get("PUBLIC_BOUNDARY_PR_TEXT_FILE")
     if pr_text_path:
         findings.extend(scan_path(Path(pr_text_path), source="pull-request-text"))

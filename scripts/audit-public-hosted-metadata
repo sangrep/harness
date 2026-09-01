@@ -190,7 +190,7 @@ def _collect_discussions(
         "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
         "discussions(first:100){pageInfo{hasNextPage}nodes{"
         "id number title body url comments(first:100){"
-        "pageInfo{hasNextPage}nodes{id body url}}}}}}}"
+        "pageInfo{hasNextPage}nodes{id body url}}}}}}"
     )
     value = _json(
         [

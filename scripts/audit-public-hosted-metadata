@@ -63,8 +63,10 @@ COLLECTION_KEYS = {
     "environments": "environments",
 }
 ATTACHMENT_PATTERN = re.compile(
-    r"https://(?:github\.com/user-attachments/assets/[0-9A-Za-z-]+|"
-    r"user-images\.githubusercontent\.com/[^\s\"'<>]+)"
+    r"(?:(?:(?:https?:)?//github\.com)?/?user-attachments/"
+    r"(?:assets/[0-9A-Za-z-]+|files/[0-9]+/[^\s\"'<>]+)|"
+    r"(?:https?:)?//user-images\.githubusercontent\.com/[^\s\"'<>]+)",
+    re.IGNORECASE,
 )
 SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}\Z")
 CREDENTIAL_KEYS = {

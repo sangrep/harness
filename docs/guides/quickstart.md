@@ -64,6 +64,8 @@ Run `python examples/replay.py` to compare exact results, or try the
 python -m mkdocs serve --dev-addr 127.0.0.1:8000
 ```
 
-The docs server is local. CI uploads an inspectable static artifact for a future
-GitHub Pages deployment; it does not deploy. Read the [threat model](../threat-model.md)
+The docs server is local. Normal CI uploads an inspectable static preview and does
+not deploy. [GitHub Pages delivery](../development/pages.md) uses a separate manual,
+master-only workflow after maintainer acceptance and activation; live availability
+requires HTTP/browser verification. Read the [threat model](../threat-model.md)
 before supplying your own material.

@@ -1,0 +1,547 @@
+from __future__ import annotations
+from sangrep_harness.ports import evidence_port_boundary
+
+import json
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
+from sangrep_harness.citations import extract_stable_id_citations
+from sangrep_harness.containment import validate_citations_within_structural_grant
+from sangrep_harness.grants import ReviewEvidenceHeadV1, SuccessfulToolCallV1, ToolEvidenceSupportV1
+from sangrep_harness.ports import SystemPromptError, build_harness_agent_system_prompt
+from sangrep_harness.review import CitationAdmissionV1, CoverageStateV1, ProviderCallStateV1, StructuralGrantV1
+from sangrep_harness.terminal import TerminalReviewDraftV1
+from sangrep_harness.model import AgentConversationTurn, AgentModelRequest, AgentModelResponse, AgentRunnerError
+from sangrep_harness.task_runtime import ReviewTaskSpecV1, TaskExecutionContextV1
+from sangrep_harness.tools import AdmittedToolRegistryV1, EvidenceReviewToolsV1, HarnessToolRequest, HarnessToolResult
+from sangrep_harness.wire import TerminalOutcomeV1
+
+
+MonotonicClock = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class AgentLoopLimits:
+    """One run's bounded iteration, tool, token, and wall-clock budget."""
+
+    max_iterations: int = 8
+    max_tool_calls: int = 20
+    max_total_tokens: int = 200_000
+    deadline_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        for field_name in ("max_iterations", "max_tool_calls", "max_total_tokens"):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise AgentRunnerError(f"{field_name} must be a positive integer.")
+        if (
+            not isinstance(self.deadline_seconds, int | float)
+            or isinstance(self.deadline_seconds, bool)
+            or self.deadline_seconds <= 0
+        ):
+            raise AgentRunnerError("deadline_seconds must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessTaskExecutionV1:
+    """One isolated modern harness invocation with no shared mutable session state."""
+
+    task: ReviewTaskSpecV1
+    context: TaskExecutionContextV1
+    limits: AgentLoopLimits
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.task) is not ReviewTaskSpecV1
+            or type(self.context) is not TaskExecutionContextV1
+            or type(self.limits) is not AgentLoopLimits
+        ):
+            raise TypeError("harness task execution authority is invalid")
+
+    @property
+    def grant(self) -> StructuralGrantV1:
+        return self.task.grant
+
+    def cancellation_requested(self) -> bool:
+        return self.context.cancellation_requested()
+
+
+class StructuralAgentTurnResultV1(Protocol):
+    response: AgentModelResponse
+    tool_results: tuple[HarnessToolResult, ...]
+
+
+StructuralAgentTurnV1 = Callable[[AgentModelRequest], StructuralAgentTurnResultV1]
+
+
+StructuralAgentTurnFactoryV1 = Callable[[EvidenceReviewToolsV1], StructuralAgentTurnV1]
+
+
+@evidence_port_boundary
+def execute_structural_review_task_v1(
+    execution: HarnessTaskExecutionV1,
+    *,
+    evidence_head: ReviewEvidenceHeadV1,
+    model_id: str,
+    turn_factory: StructuralAgentTurnFactoryV1,
+    responses_min_output_tokens: int | None = None,
+    monotonic_clock: MonotonicClock = time.monotonic,
+) -> TerminalReviewDraftV1:
+    """Execute one grant-bound DOCX child through a provider-neutral gateway turn port."""
+
+    if type(execution) is not HarnessTaskExecutionV1:
+        raise TypeError("execution must use HarnessTaskExecutionV1")
+    if not isinstance(evidence_head, ReviewEvidenceHeadV1):
+        raise TypeError("evidence_head must use ReviewEvidenceHeadV1")
+    if type(model_id) is not str or not model_id.strip():
+        raise ValueError("model_id must be normalized non-empty text")
+    if responses_min_output_tokens is not None and (
+        type(responses_min_output_tokens) is not int or responses_min_output_tokens != 16
+    ):
+        raise ValueError("responses_min_output_tokens must be null or 16")
+    if not callable(turn_factory) or not callable(monotonic_clock):
+        raise TypeError("structural review factories must be callable")
+    grant = execution.grant
+    evidence_head.require_grant(grant)
+    if (
+        responses_min_output_tokens is not None
+        and execution.limits.max_total_tokens < responses_min_output_tokens
+    ):
+        return _structural_failure_draft(
+            TerminalOutcomeV1.BUDGET_EXHAUSTED,
+            evidence_head=evidence_head,
+            grant=grant,
+            provider_call_state=ProviderCallStateV1.NOT_REQUESTED,
+        )
+    tools = EvidenceReviewToolsV1(
+        grant=grant,
+        evidence_head=evidence_head,
+        registry=AdmittedToolRegistryV1(),
+    )
+    turn = turn_factory(tools)
+    if not callable(turn):
+        raise TypeError("turn_factory must return one callable agent turn")
+    try:
+        system_prompt = build_harness_agent_system_prompt(
+            execution.task.instruction,
+            finding_proposals_enabled=False,
+            selection_proposals_enabled=False,
+        )
+    except SystemPromptError as error:
+        raise AgentRunnerError("Could not build the structural review prompt.") from error
+    conversation = [
+        AgentConversationTurn(
+            role="user",
+            content=(
+                f"Review question: {execution.task.instruction.strip()}\n\n"
+                "The evidence body is not included in this turn. Use the granted read-only "
+                "tools to inspect it before answering."
+            ),
+        )
+    ]
+    total_tokens_in: int | None = None
+    total_tokens_out: int | None = None
+    provider_name: str | None = None
+    citation_repair_used = False
+    deadline_at = min(
+        execution.context.deadline_monotonic,
+        monotonic_clock() + execution.limits.deadline_seconds,
+    )
+    for _iteration in range(1, execution.limits.max_iterations + 1):
+        if execution.cancellation_requested():
+            return _structural_failure_draft(
+                TerminalOutcomeV1.CANCELLED,
+                evidence_head=evidence_head,
+                grant=grant,
+                provider_call_state=(
+                    ProviderCallStateV1.NOT_REQUESTED
+                    if provider_name is None
+                    else ProviderCallStateV1.COMPLETED
+                ),
+            )
+        remaining = deadline_at - monotonic_clock()
+        if remaining <= 0:
+            return _structural_failure_draft(
+                TerminalOutcomeV1.BUDGET_EXHAUSTED,
+                evidence_head=evidence_head,
+                grant=grant,
+                provider_call_state=(
+                    ProviderCallStateV1.NOT_REQUESTED
+                    if provider_name is None
+                    else ProviderCallStateV1.COMPLETED
+                ),
+            )
+        remaining_tokens = execution.limits.max_total_tokens - (
+            (total_tokens_in or 0) + (total_tokens_out or 0)
+        )
+        if remaining_tokens <= 0 or (
+            responses_min_output_tokens is not None
+            and remaining_tokens < responses_min_output_tokens
+        ):
+            return _structural_failure_draft(
+                TerminalOutcomeV1.BUDGET_EXHAUSTED,
+                evidence_head=evidence_head,
+                grant=grant,
+                provider_call_state=(
+                    ProviderCallStateV1.NOT_REQUESTED
+                    if provider_name is None
+                    else ProviderCallStateV1.COMPLETED
+                ),
+            )
+        request = AgentModelRequest(
+            system_prompt=system_prompt,
+            rendered_input=_render_conversation(tuple(conversation)),
+            model=model_id,
+            agent_name="docx-review",
+            conversation=tuple(conversation),
+            tool_definitions=tools.definitions,
+            timeout_seconds=remaining,
+            max_output_tokens=remaining_tokens,
+            admitted_max_tool_calls=(
+                execution.limits.max_tool_calls if responses_min_output_tokens is not None else None
+            ),
+            remaining_tool_calls=(
+                execution.limits.max_tool_calls
+                - sum(len(turn.tool_calls) for turn in conversation if turn.role == "assistant")
+                if responses_min_output_tokens is not None
+                else None
+            ),
+        )
+        result = turn(request)
+        response = result.response
+        tool_results = result.tool_results
+        _validate_model_response(response)
+        if type(tool_results) is not tuple or any(
+            type(item) is not HarnessToolResult for item in tool_results
+        ):
+            raise AgentRunnerError("Agent turn returned invalid structural tool results.")
+        if len(tool_results) != len(response.tool_calls) or any(
+            tool_result.call_id != tool_call.call_id or tool_result.name != tool_call.name
+            for tool_result, tool_call in zip(
+                tool_results,
+                response.tool_calls,
+                strict=True,
+            )
+        ):
+            raise AgentRunnerError("Agent turn tool results do not match its model response.")
+        provider_name = _consistent_provider_name(response, expected=provider_name)
+        total_tokens_in = _add_optional_tokens(total_tokens_in, response.tokens_in)
+        total_tokens_out = _add_optional_tokens(total_tokens_out, response.tokens_out)
+        try:
+            _enforce_token_budget(
+                total_tokens_in,
+                total_tokens_out,
+                execution.limits.max_total_tokens,
+            )
+        except AgentRunnerError:
+            return _structural_failure_draft(
+                TerminalOutcomeV1.BUDGET_EXHAUSTED,
+                evidence_head=evidence_head,
+                grant=grant,
+                provider_call_state=ProviderCallStateV1.COMPLETED,
+            )
+        if response.tool_calls:
+            conversation.append(
+                AgentConversationTurn(
+                    role="assistant",
+                    content=response.output,
+                    tool_calls=response.tool_calls,
+                    provider_state=response.provider_state,
+                    private_provider_continuation=(response.private_provider_continuation),
+                    private_provider_raw_response_sha256=(
+                        response.private_provider_raw_response_sha256
+                    ),
+                )
+            )
+            for tool_result in tool_results:
+                conversation.append(
+                    AgentConversationTurn(
+                        role="tool",
+                        content=_canonical_json(
+                            {
+                                "callId": tool_result.call_id,
+                                "name": tool_result.name,
+                                "status": tool_result.status,
+                                "payload": tool_result.payload,
+                                "projectionSha256": tool_result.projection_digest,
+                                "citableStableIds": list(tool_result.citable_stable_ids),
+                            }
+                        ),
+                        tool_call_id=tool_result.call_id,
+                        tool_name=tool_result.name,
+                    )
+                )
+            continue
+        validation_error = structural_citation_validation_error(
+            response.output,
+            grant=grant,
+            evidence_head=evidence_head,
+            successful_tool_calls=tools.successful_tool_calls,
+        )
+        if validation_error is not None:
+            if citation_repair_used:
+                return _structural_failure_draft(
+                    TerminalOutcomeV1.ENGINE_FAILED,
+                    evidence_head=evidence_head,
+                    grant=grant,
+                    provider_call_state=ProviderCallStateV1.COMPLETED,
+                )
+            citation_repair_used = True
+            conversation.extend(
+                (
+                    AgentConversationTurn(
+                        role="assistant",
+                        content=response.output,
+                        provider_state=response.provider_state,
+                        private_provider_continuation=(response.private_provider_continuation),
+                        private_provider_raw_response_sha256=(
+                            response.private_provider_raw_response_sha256
+                        ),
+                    ),
+                    AgentConversationTurn(
+                        role="user",
+                        content=(
+                            "Your candidate answer did not contain a valid citation from an "
+                            "exact successful evidence tool result. Answer once more using at "
+                            "least one exact [id:<stable_id>] returned as citable evidence."
+                        ),
+                    ),
+                )
+            )
+            continue
+        citations = _structural_citations(
+            response.output,
+            grant=grant,
+            evidence_head=evidence_head,
+            successful_tool_calls=tools.successful_tool_calls,
+        )
+        inspected = {
+            (support.anchor_id, support.occurrence_id)
+            for call in tools.successful_tool_calls
+            for support in call.supports
+        }
+        granted_count = len(evidence_head.granted_nodes(grant))
+        unreviewed_count = max(0, granted_count - len(inspected))
+        return TerminalReviewDraftV1(
+            outcome=TerminalOutcomeV1.SUPPORTED_ANSWER,
+            answer=response.output,
+            citations=citations,
+            evidence_gap_codes=(),
+            inspected_count=len(inspected),
+            unreviewed_count=unreviewed_count,
+            coverage_state=(
+                CoverageStateV1.COMPLETE if unreviewed_count == 0 else CoverageStateV1.PARTIAL
+            ),
+            clarification_question_id=None,
+            provider_call_state=ProviderCallStateV1.COMPLETED,
+        )
+    return _structural_failure_draft(
+        TerminalOutcomeV1.BUDGET_EXHAUSTED,
+        evidence_head=evidence_head,
+        grant=grant,
+        provider_call_state=(
+            ProviderCallStateV1.NOT_REQUESTED
+            if provider_name is None
+            else ProviderCallStateV1.COMPLETED
+        ),
+    )
+
+
+def _structural_failure_draft(
+    outcome: TerminalOutcomeV1,
+    *,
+    evidence_head: ReviewEvidenceHeadV1,
+    grant: StructuralGrantV1,
+    provider_call_state: ProviderCallStateV1,
+) -> TerminalReviewDraftV1:
+    unreviewed_count = len(evidence_head.granted_nodes(grant))
+    return TerminalReviewDraftV1(
+        outcome=outcome,
+        answer=None,
+        citations=(),
+        evidence_gap_codes=(),
+        inspected_count=0,
+        unreviewed_count=unreviewed_count,
+        coverage_state=CoverageStateV1.PARTIAL,
+        clarification_question_id=None,
+        provider_call_state=provider_call_state,
+    )
+
+
+def _structural_citations(
+    output: str,
+    *,
+    grant: StructuralGrantV1,
+    evidence_head: ReviewEvidenceHeadV1,
+    successful_tool_calls: tuple[SuccessfulToolCallV1, ...],
+) -> tuple[CitationAdmissionV1, ...]:
+    call_ids = tuple(call.call_id for call in successful_tool_calls)
+    cited_ids = tuple(
+        dict.fromkeys(citation.stable_id for citation in extract_stable_id_citations(output))
+    )
+    admissions = []
+    for stable_id in cited_ids:
+        matches = tuple(
+            (call, support)
+            for call in successful_tool_calls
+            for support in call.supports
+            if support.anchor_id == stable_id
+        )
+        unique_matches: dict[
+            tuple[str, str, str, str, str],
+            tuple[SuccessfulToolCallV1, ToolEvidenceSupportV1],
+        ] = {}
+        for call, support in matches:
+            support_identity = (
+                support.root_anchor_id,
+                support.anchor_id,
+                support.occurrence_id,
+                support.projected_payload_sha256,
+                support.exact_quote_sha256,
+            )
+            unique_matches.setdefault(support_identity, (call, support))
+        if len(unique_matches) != 1:
+            raise AgentRunnerError("Cited evidence does not have one exact successful tool result.")
+        call, support = next(iter(unique_matches.values()))
+        admissions.append(
+            CitationAdmissionV1.create(
+                address={
+                    "schemaVersion": 1,
+                    "kind": "citationAddress",
+                    "evidenceVersionId": grant.evidence_binding.evidence_version_id,
+                    "structureRevisionId": grant.evidence_binding.structure_revision_id,
+                    "projectionRevisionId": grant.evidence_binding.projection_revision_id,
+                    "rootAnchorId": support.root_anchor_id,
+                    "anchorId": support.anchor_id,
+                    "occurrenceId": support.occurrence_id,
+                    "selector": {"kind": "node", "anchorId": support.anchor_id},
+                    "exactQuoteSha256": support.exact_quote_sha256,
+                    "projectionProfileId": (
+                        evidence_head.projection_revision.projection_profile_id
+                    ),
+                    "projectionProfileVersion": (
+                        evidence_head.projection_revision.projection_profile_version
+                    ),
+                    "projectionPayloadSha256": (evidence_head.projection_revision.payload_sha256),
+                    "admittedByToolCallId": call.call_id,
+                },
+                grant=grant,
+                admitted_tool_call_ids=call_ids,
+            )
+        )
+    return tuple(admissions)
+
+
+def _validate_model_response(response: AgentModelResponse) -> None:
+    if not isinstance(response, AgentModelResponse):
+        raise AgentRunnerError("model_callable must return AgentModelResponse.")
+    if response.output.strip() == "" and not response.tool_calls:
+        raise AgentRunnerError("Model response must contain output or at least one tool call.")
+    _validate_optional_tokens("tokens_in", response.tokens_in)
+    _validate_optional_tokens("tokens_out", response.tokens_out)
+    if len({call.call_id for call in response.tool_calls}) != len(response.tool_calls):
+        raise AgentRunnerError("Model response contains duplicate tool call IDs.")
+
+
+def _consistent_provider_name(
+    response: AgentModelResponse,
+    *,
+    expected: str | None,
+) -> str:
+    provider_name = response.provider_name
+    if (
+        not isinstance(provider_name, str)
+        or provider_name.strip() == ""
+        or provider_name != provider_name.strip()
+    ):
+        raise AgentRunnerError("Model response provider_name is required and must be normalized.")
+    if expected is not None and provider_name != expected:
+        raise AgentRunnerError(
+            f"Model response provider_name changed from {expected!r} to {provider_name!r} "
+            "within one run."
+        )
+    return provider_name
+
+
+def _validate_optional_tokens(field_name: str, value: int | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise AgentRunnerError(f"{field_name} must be a non-negative integer.")
+
+
+def _add_optional_tokens(total: int | None, value: int | None) -> int | None:
+    if value is None:
+        return total
+    return (total or 0) + value
+
+
+def _enforce_token_budget(
+    tokens_in: int | None,
+    tokens_out: int | None,
+    maximum: int,
+) -> None:
+    known_total = (tokens_in or 0) + (tokens_out or 0)
+    if known_total > maximum:
+        raise AgentRunnerError(
+            f"BUDGET_EXCEEDED: run used {known_total} known tokens; limit is {maximum}."
+        )
+
+
+@evidence_port_boundary
+def structural_citation_validation_error(
+    output: str,
+    *,
+    grant: StructuralGrantV1,
+    evidence_head: ReviewEvidenceHeadV1,
+    successful_tool_calls: tuple[SuccessfulToolCallV1, ...],
+) -> str | None:
+    """Validate a terminal answer against exact grant-bound successful-tool evidence."""
+
+    citations = extract_stable_id_citations(output)
+    if not citations:
+        return "A corpus answer must contain at least one valid in-scope citation."
+    violations = validate_citations_within_structural_grant(
+        output,
+        grant=grant,
+        evidence_head=evidence_head,
+        successful_tool_calls=successful_tool_calls,
+    )
+    if violations:
+        invalid_ids = ", ".join(dict.fromkeys(violation.stable_id for violation in violations))
+        return f"Answer cited stable IDs not returned as citable evidence: {invalid_ids}."
+    return None
+
+
+def _render_conversation(turns: tuple[AgentConversationTurn, ...]) -> str:
+    return _canonical_json({"conversation": [_conversation_turn_payload(turn) for turn in turns]})
+
+
+def _conversation_turn_payload(
+    turn: AgentConversationTurn,
+    *,
+    include_provider_state: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "role": turn.role,
+        "content": turn.content,
+        "toolCalls": [_tool_request_payload(call) for call in turn.tool_calls],
+        "toolCallId": turn.tool_call_id,
+        "toolName": turn.tool_name,
+    }
+    if include_provider_state:
+        payload["providerState"] = turn.provider_state
+    return payload
+
+
+def _tool_request_payload(request: HarnessToolRequest) -> dict[str, object]:
+    return {
+        "callId": request.call_id,
+        "name": request.name,
+        "arguments": request.arguments,
+    }
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)

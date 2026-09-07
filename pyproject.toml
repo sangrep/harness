@@ -1,0 +1,42 @@
+[project]
+name = "sangrep-harness"
+version = "0.1.0.dev0"
+description = "Bounded, deterministic cited evidence review for Markdown and text"
+readme = "README.md"
+license = "AGPL-3.0-or-later OR LicenseRef-Sangrep-Commercial"
+license-files = ["LICENSE", "NOTICE", "LICENSES/*.txt"]
+requires-python = ">=3.11"
+dependencies = ["sangrep-contracts==0.1.0.dev0", "pydantic==2.12.5"]
+
+[project.scripts]
+sangrep-harness = "sangrep_harness.cli:main"
+
+[project.urls]
+Repository = "https://github.com/sangrep/harness"
+Issues = "https://github.com/sangrep/harness/issues"
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sangrep_harness"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "corpus", "docs", "scripts", "provenance", "requirements-dev.in", "requirements-dev.txt", "requirements-runtime.in", "requirements-runtime.txt", "mkdocs.yml", "*.md", "LICENSE", "NOTICE", "LICENSES", "pyproject.toml", ".github", ".gitignore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "-q"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/sangrep_harness"]

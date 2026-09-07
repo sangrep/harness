@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "question": "Quote the rule.",
+  "evidence": {
+    "relativePath": "rules.txt",
+    "text": "Only observers enter.\n"
+  },
+  "provider": "cited"
+}

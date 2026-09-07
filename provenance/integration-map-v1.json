@@ -1,0 +1,450 @@
+{
+  "files": {
+    "corpus/README.md": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "58064fbaf077dcdb1b6401c003c9d2fb26bf7bc110ab28e6334324286e3c00a9"
+    },
+    "corpus/adversarial.md": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "7e8823a0d9ddba1a02703bac8072455b3112ef86b2625db4f3064d187b136f9f"
+    },
+    "corpus/notes.txt": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "3e74e25ef077e3efae719066a557631cb036c3d653e5bca60c707a86b85d577d"
+    },
+    "corpus/operations.md": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "0038fdb9dfdfd5172310c32b4cec03ee58c6d52dcd45a9ca89dfa9e91b19638b"
+    },
+    "examples/batch.jsonl": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "29ddb3199b42ad1a51e6d347705a59828834efb5fd9838634fe1577eb9096c2c"
+    },
+    "examples/cited_review.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "d81369fa8c505253a3a9dfa552b0129ea11f1b5b73f54ab194835810e0ec5562"
+    },
+    "examples/custom_evidence_adapter.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "1df25ad2f700c7af9dd14d44373755dba16f4bea4bd6bef20d9b991c68c5be66"
+    },
+    "examples/failure.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "c870e83c6602b131df11a2f0e89c8321647128eb9cb16231fcd269b90b195fb3"
+    },
+    "examples/gap.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "df7c14d98a37cdd9642a37fcca358ba33b0872394f8351ca73a6a25d5c893819"
+    },
+    "examples/replay.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "7b89a6bcfd44b10f41993c72015921464b54a24473e08a6dd5f4825f26ede3b0"
+    },
+    "examples/request.json": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "2d98e315bdbb05334176f00bb7575b281e0a15e58bbf7b0793a6414dc36f2db0"
+    },
+    "examples/retry.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "f661125b680eb997b483ec4cb4e7796cfda133b69a7044cb4afae5f7ac6a7c59"
+    },
+    "src/sangrep_harness/__init__.py": {
+      "importInputs": {
+        "src/sangrep_harness/__init__.py": "c9cf9ee78f4ea4b49a83dc20a257f1b464e26137ec19713743dc5350e1ec4444"
+      },
+      "origin": "adapted-import",
+      "sha256": "5184813698fd5bde5b0f56eeddda76c06aedcbb0aeac5fbf9e663c5bfb540e3c"
+    },
+    "src/sangrep_harness/__main__.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "1330f4585c933b6a1d63fec39942df0a7be5a2a1f9086d1d599e8d6365b9907c"
+    },
+    "src/sangrep_harness/api.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "38c0511e0125336c27d51a5172a9cf9519f69fc33b896e5f93529f89c82a85fe"
+    },
+    "src/sangrep_harness/citations.py": {
+      "importInputs": {
+        "src/sangrep_harness/citations.py": "7c6fbd7cd88ec75ee40eb583cb8adbcce346cae5cc936600cc7a577317b3a5f3"
+      },
+      "origin": "adapted-import",
+      "sha256": "b611436f3d387fbf0c239836468ee05bf7f3c7b9a9d8d101212024116937e533"
+    },
+    "src/sangrep_harness/cli.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "9cbae0593e00a0e35d5c9b26854780b3976b821de8e6a3104c0a5498e3fbf864"
+    },
+    "src/sangrep_harness/containment.py": {
+      "importInputs": {
+        "src/sangrep_harness/containment.py": "c2895188d95567aa6cbfe8d18608e8ccdd38ffd3bd9961483efd81538fdcff0a"
+      },
+      "origin": "adapted-import",
+      "sha256": "beb5436ff92957622ce1688ddf733b5d81abccac40c7a899ba8177ae69e41f95"
+    },
+    "src/sangrep_harness/context.py": {
+      "importInputs": {
+        "src/sangrep_harness/context.py": "3ee052c9aebf93cadb68225ee0749244bc6fd918e38f71ed6264d2659656dff8"
+      },
+      "origin": "adapted-import",
+      "sha256": "b246992723679b6375e9a3fb1f5c560808f88d2d58ff1a3e6a969559765d77d7"
+    },
+    "src/sangrep_harness/context_assembly.py": {
+      "importInputs": {
+        "src/sangrep_harness/context_assembly.py": "a21a9372c4abd4d2b2c81ac406a36a8f949c5444ea37ae28954d95c788543a86"
+      },
+      "origin": "adapted-import",
+      "sha256": "a53bd4ce027a8a4cea468bd7c143919cbd8e90897050fe2aefd26184c406fa1f"
+    },
+    "src/sangrep_harness/diagnostics.py": {
+      "importInputs": {
+        "src/sangrep_harness/diagnostics.py": "6828e772cec59169e8d4139219dd51c1b8c4063afab1cc3c8fcf3f1f8de9abd3"
+      },
+      "origin": "adapted-import",
+      "sha256": "6828e772cec59169e8d4139219dd51c1b8c4063afab1cc3c8fcf3f1f8de9abd3"
+    },
+    "src/sangrep_harness/engine.py": {
+      "importInputs": {
+        "src/sangrep_harness/engine.py": "6fd01df0e11fbab256daef3180d18516af44fb8b284593b690b23fa77d7f0749"
+      },
+      "origin": "adapted-import",
+      "sha256": "ffd85788c35af391313fcb98ac052c9517f39483771d8909646d1c883f826933"
+    },
+    "src/sangrep_harness/events.py": {
+      "importInputs": {
+        "src/sangrep_harness/events.py": "a918913c77511e2131b1c49a46027f21491c979231c0c4de8bc3cf50bd473b2c"
+      },
+      "origin": "adapted-import",
+      "sha256": "925bcfa4062fa4b8c4381fdb287ea7b96cfec1c33acffa3601267dfd3ba2fcf9"
+    },
+    "src/sangrep_harness/evidence_head.py": {
+      "importInputs": {
+        "adaptation/evidence_head.py.txt": "53439aff8e29e8f115e41ceb3bd0ef3da0c0f655fa9ea0c4ef8be8516a4e2013"
+      },
+      "origin": "adapted-import",
+      "sha256": "068bd105a23dd0094840b1b422e45ca62c03b27c6c04cf4f2ee18500f551f0cb"
+    },
+    "src/sangrep_harness/evidence_models.py": {
+      "importInputs": {
+        "adaptation/evidence_head.py.txt": "53439aff8e29e8f115e41ceb3bd0ef3da0c0f655fa9ea0c4ef8be8516a4e2013"
+      },
+      "origin": "adapted-import",
+      "sha256": "0e3180bf75f1803989a727830b2e7e20dc863bb20721c3546e5f54aa367f3c7e"
+    },
+    "src/sangrep_harness/grants.py": {
+      "importInputs": {
+        "src/sangrep_harness/grants.py": "d37229d7148255a98d0703181f84ea22e4f5fd99010e52ddf62e3b36f0071742"
+      },
+      "origin": "adapted-import",
+      "sha256": "13aabca3d38218ab77ad945a79d77b737405ce8789ac3b253e01d47963f9b17a"
+    },
+    "src/sangrep_harness/inspection_receipts.py": {
+      "importInputs": {
+        "src/sangrep_harness/inspection_receipts.py": "8a79a2384e60a36dc78f34da463e5106d1779e23f44ef3d791e651290b9135c8"
+      },
+      "origin": "adapted-import",
+      "sha256": "e12ce92df5115d9946e81045e723359df7220fd35f971999fb036f4f289e39cb"
+    },
+    "src/sangrep_harness/ledger.py": {
+      "importInputs": {
+        "adaptation/run_ledger.py.txt": "62cd8e8b9e6309cbf1fb60800d4631ff00e4ab5a45fcc22ee08f72090ed8d23d",
+        "adaptation/terminal_recovery.py.txt": "27c3cdc814160d5e644e10d1aeb02ac0e0447878b3e8d731ed0077e4a793a7c1"
+      },
+      "origin": "adapted-import",
+      "sha256": "e82f0f7e55964c0739c8f4eab190e1cec817a6ecf6ce47310aed3214a2dfc474"
+    },
+    "src/sangrep_harness/media.py": {
+      "importInputs": {
+        "src/sangrep_harness/media.py": "208e72f78e8927bd2083b663865a69e3ade8f8241c26050fa7f85c46c5f5f81b"
+      },
+      "origin": "adapted-import",
+      "sha256": "208e72f78e8927bd2083b663865a69e3ade8f8241c26050fa7f85c46c5f5f81b"
+    },
+    "src/sangrep_harness/model.py": {
+      "importInputs": {
+        "src/sangrep_harness/model.py": "140026632ec52ec4c042bb20a0e2306c6ad560704f0c55beb452d8da7226cb3c"
+      },
+      "origin": "adapted-import",
+      "sha256": "945a534800c82f2a1b2c53e88594c2686e5b35ad9aee22ed701f651bbf675e8a"
+    },
+    "src/sangrep_harness/ports.py": {
+      "importInputs": {
+        "src/sangrep_harness/ports.py": "0daa4433a277725a896da359a42098e6ccf3a28f430cde7b07c99a8fc722dfbe"
+      },
+      "origin": "adapted-import",
+      "sha256": "5742f70df2411280ef5005a5039a283b122aa021a06fc63a1088a1deff54b160"
+    },
+    "src/sangrep_harness/prompt.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "a51957c08cf279b4690ab8c1a516d7c76d4333c7f9d395ff51c55d23cfb1be91"
+    },
+    "src/sangrep_harness/providers/__init__.py": {
+      "importInputs": {
+        "src/sangrep_harness/providers/__init__.py": "c9cf9ee78f4ea4b49a83dc20a257f1b464e26137ec19713743dc5350e1ec4444"
+      },
+      "origin": "adapted-import",
+      "sha256": "c9cf9ee78f4ea4b49a83dc20a257f1b464e26137ec19713743dc5350e1ec4444"
+    },
+    "src/sangrep_harness/providers/base.py": {
+      "importInputs": {
+        "src/sangrep_harness/providers/base.py": "e60caa5935ce4a63de6aea04f841e4a6d33e73e60139f7357af53abf0812b94e"
+      },
+      "origin": "adapted-import",
+      "sha256": "e3f890c17b3f0b0b2b8a5cbc4dba64ecc94dc425d5f2cfb2dbe1ce6b1805a3d1"
+    },
+    "src/sangrep_harness/providers/egress.py": {
+      "importInputs": {
+        "src/sangrep_harness/providers/egress.py": "6efac391d86fb6d6c5c445c14bdeb92b8c285a58198e0bb4c63ac61a5a1d96d3"
+      },
+      "origin": "adapted-import",
+      "sha256": "66e0ba386d0c8127495811e52438e5ec25de3f6e8d63987fd637e9995b19ba87"
+    },
+    "src/sangrep_harness/providers/exchange.py": {
+      "importInputs": {
+        "adaptation/provider_exchange.py.txt": "81c78d6aa77163e37503745b9c981905d705f35a12ce7f75db9f0143bb4668f9"
+      },
+      "origin": "adapted-import",
+      "sha256": "5b9d02da0ef318a6abaa42046c922cdabf7ed1416d33cea393dca905450a08d8"
+    },
+    "src/sangrep_harness/providers/extractive.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "a5ca4ac4ae9ecfe29dafb2bbcc75e5d92dfe4a01a550f2e9017eed7117743bb6"
+    },
+    "src/sangrep_harness/providers/fake.py": {
+      "importInputs": {
+        "src/sangrep_harness/providers/fake.py": "b202e4bdd1a195883175759b6fbdec2c92c8272f12d1aa3171bdb22c148b73d6"
+      },
+      "origin": "adapted-import",
+      "sha256": "474d75b387b1e715dfff287e601279e7be198c4558270477ad3b6afe110c7e88"
+    },
+    "src/sangrep_harness/providers/replay_provider.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "137ce9fb3151c01670b92f514d035c266929ae555c6afdb97548bd564f4d2a7e"
+    },
+    "src/sangrep_harness/py.typed": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "src/sangrep_harness/receipt_events.py": {
+      "importInputs": {
+        "src/sangrep_harness/receipt_events.py": "716745629d72025b78b1b8c1bf4c85deddf9dc52ee5eefe8d25b31b7345b9a44"
+      },
+      "origin": "adapted-import",
+      "sha256": "716745629d72025b78b1b8c1bf4c85deddf9dc52ee5eefe8d25b31b7345b9a44"
+    },
+    "src/sangrep_harness/reconcile.py": {
+      "importInputs": {
+        "src/sangrep_harness/reconcile.py": "2c9730522ebedeab4a167fa2d819d8d54a670482524566ac370610a0d76b96c9"
+      },
+      "origin": "adapted-import",
+      "sha256": "79308da12a3daff25385d1aa33d8a603f63ec4931bb378f86e013258db076647"
+    },
+    "src/sangrep_harness/replay.py": {
+      "importInputs": {
+        "src/sangrep_harness/replay.py": "d55af68a50425bea51b9f309ade26d4ad88f2717adcf38e7fbb141042e3bbde8"
+      },
+      "origin": "adapted-import",
+      "sha256": "6a75a555385149c2b65a70312d96967dce3e5ae2942583bcd75470fbcc08a51f"
+    },
+    "src/sangrep_harness/review.py": {
+      "importInputs": {
+        "src/sangrep_harness/review.py": "4f4fc455ba29d37a740d00d60065a4e83df0a3fff1783ab2dd0a07f472c57c77"
+      },
+      "origin": "adapted-import",
+      "sha256": "5ff644940960c65e22f4f9abddaab6564a8aab7d032b8b6a8102325e121f8d6c"
+    },
+    "src/sangrep_harness/structural_loop.py": {
+      "importInputs": {
+        "adaptation/structural_loop.py.txt": "9a9dd0b1626ecdc5e4a3538b736309807f7a672a97545e9b5cb29b8149fa6551"
+      },
+      "origin": "adapted-import",
+      "sha256": "b39a699bc4e53ab3866232b8538b29600a9a353efef3a4d815ec21a96c89031e"
+    },
+    "src/sangrep_harness/task_orchestration.py": {
+      "importInputs": {
+        "adaptation/durable_tasks.py.txt": "0d55a0feb980742b3afbe52e2bd7af5a34215727ac87c7a7b88aac0c23e58ed8"
+      },
+      "origin": "adapted-import",
+      "sha256": "ba81927a55f7c3da18567c772349f5dc2a13e7da9a786c51bcbf7b7524c34c69"
+    },
+    "src/sangrep_harness/task_runtime.py": {
+      "importInputs": {
+        "src/sangrep_harness/task_runtime.py": "08e55f9ea024fca6c1c97e152d14498b18b401a7efc5b91f1c37fa25a6d7c196"
+      },
+      "origin": "adapted-import",
+      "sha256": "35ef388434a07ee631fd037608a8c8787858fbbe798e60a68fcac7c67c5e3ea3"
+    },
+    "src/sangrep_harness/task_store.py": {
+      "importInputs": {
+        "adaptation/durable_tasks.py.txt": "0d55a0feb980742b3afbe52e2bd7af5a34215727ac87c7a7b88aac0c23e58ed8"
+      },
+      "origin": "adapted-import",
+      "sha256": "6c0271df6f847877f4646468cab477960561f12bdb55b71a286ea15476462c49"
+    },
+    "src/sangrep_harness/terminal.py": {
+      "importInputs": {
+        "src/sangrep_harness/terminal.py": "70f2727baa0ea6e43397e6326abfeaa7ba7d7b1a76d546f4008d07426248bdc3"
+      },
+      "origin": "adapted-import",
+      "sha256": "772bde2c9d9853d219d8427bed21b5871600f8f2d188b3c4d46c95df9be24d08"
+    },
+    "src/sangrep_harness/text_snapshot.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "54a27cc39942f10b0b4c32562784aee0d9b9dbf597f63cced2d8687a3fd4cb9b"
+    },
+    "src/sangrep_harness/text_validation.py": {
+      "importInputs": {
+        "src/sangrep_harness/text_validation.py": "782dc22b7c27122816153d1fb958da20ca4edaf394ed8f890a4ab75df1c9023c"
+      },
+      "origin": "adapted-import",
+      "sha256": "999a0db79eb029cde5d7f5d757a9a5723891945b5cd1f29c761d4ae0f3b1d03d"
+    },
+    "src/sangrep_harness/tools.py": {
+      "importInputs": {
+        "adaptation/evidence_tools.py.txt": "6c2032a991febb3d68f84f8e4e247b1135e73e3287f9941f018226f036ae73ab",
+        "src/sangrep_harness/tools.py": "8be437a4daa444bc6042abd96c40ef7c9ddc1274fc8a6d074c5e0839ca10ae67"
+      },
+      "origin": "adapted-import",
+      "sha256": "749ce213a24c5cb421642ecb0f7672606a986cac335841559d11c99995f656e7"
+    },
+    "src/sangrep_harness/wire.py": {
+      "importInputs": {
+        "src/sangrep_harness/wire.py": "e19ba3bd9e67dd357a115f092b4837ae7e086f8ff19a44e7740ae0660e2d9d26"
+      },
+      "origin": "adapted-import",
+      "sha256": "bdf8c90b3fab08f892f5f9fe79fb85b2a34e059185f476f3079896a9b8600994"
+    },
+    "tests/synthetic_helpers.py": {
+      "importInputs": {
+        "tests/synthetic_helpers.py": "e81bebca7d4750ec45ff005e66582d26b7c5c087f5e156255174f08a2d9ddae9"
+      },
+      "origin": "adapted-import",
+      "sha256": "238025c235e2412fa96399f9442cf76a04c8594602edf4e437043c18df10dbae"
+    },
+    "tests/test_cli.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "295fa994cd6851a3a57a35aed30c3cc9528d51b3a882b648dbea83e6a45dbe7c"
+    },
+    "tests/test_context.py": {
+      "importInputs": {
+        "tests/test_context.py": "49c273092e910f6ecb95bd57409d08d13be9a0d473dc16e2fb4eb0d26eb9e1bd"
+      },
+      "origin": "adapted-import",
+      "sha256": "0f107be387bdd00bf867beecdec237397c8b0d09ecf8681b6df641e24ce9375d"
+    },
+    "tests/test_context_assembly.py": {
+      "importInputs": {
+        "tests/test_context_assembly.py": "d14faf1fc40f21bcd48268554decd706542da2c61f43d6179d9b39d6694277a8"
+      },
+      "origin": "adapted-import",
+      "sha256": "71e915c3134664df7b55d4222314877485de3c84e99a8644c6572ab1aea3e96a"
+    },
+    "tests/test_dependency_boundary.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "bbdf69604da3bf687dd546d1f64b01d1a7949c33558c966d5915b55a65484a10"
+    },
+    "tests/test_egress.py": {
+      "importInputs": {
+        "tests/test_egress.py": "86b68e277eeeedb1782dc214f94173b0bbd6d1ee15164ef73b3dba44690a3029"
+      },
+      "origin": "adapted-import",
+      "sha256": "3cc90d05d343c1c4facacd073fd49a4b39bda2d379e111fedd0643be87b83df1"
+    },
+    "tests/test_event_stream.py": {
+      "importInputs": {
+        "tests/test_event_stream.py": "fac03654439377cad383a16895631b6c493b3c57ae1faf24a9dab790e859f8c2"
+      },
+      "origin": "adapted-import",
+      "sha256": "1760732589bf806ccd7768d13e6b206534ae852290a595fafc949ebd7a0411f7"
+    },
+    "tests/test_evidence_authority.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "509c5af4e05e368217c80daa9ee0cda38430d1fdbf4c692f20796a76fe4702cd"
+    },
+    "tests/test_evidence_ports.py": {
+      "importInputs": {
+        "tests/test_evidence_ports.py": "4b7c7b433a2513df451ddb295282d22bc4b110f2c901412cb02bff0bbaf06f05"
+      },
+      "origin": "adapted-import",
+      "sha256": "5bdbb0e04117efa1c8d74b95822813dcbb65a65690dccdd01c815bc8350f7e8d"
+    },
+    "tests/test_headless_review.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "b75d85978d9d7beb4c55627b9d5422736465259e3f7007f8642ce428cf4ec3c9"
+    },
+    "tests/test_provider_exchange.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "08a9da22cfb18e4da8a03f00d29c9a5338628fe9d6982f6ab958aba444a7ad3d"
+    },
+    "tests/test_public_artifacts.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "2bd20a34f510d0d796c9b584f2f2e3e646110616b751e4f92f342e2a47869e7d"
+    },
+    "tests/test_public_contract_compatibility.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "c28245c41535a374e6dd0d2ab97094f6d6cf4b72d8a965ffac9f33e9842baba7"
+    },
+    "tests/test_replay.py": {
+      "importInputs": {
+        "tests/test_replay.py": "03f5e7dab42be16dcc056bc9be96d70573891fe084c0a6396bd06ee65e9cbf91"
+      },
+      "origin": "adapted-import",
+      "sha256": "229496a8f28d6e0be2f511ba37e43e2e09259041909cf8c2cdcd812aa2c00c4d"
+    },
+    "tests/test_review_deadline_authority_regressions.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "855d4ed2951d0e7899725e0e1a3e4cfeee90846b4abb5e682cf3375ebe6868da"
+    },
+    "tests/test_run_recovery.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "99429a9462288dafcc179b32b69ddb7b0b2b5798de1b0ba9f216a28010377dd6"
+    },
+    "tests/test_runtime_boundaries.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "ed9e2f8e8d1cf152a604e6c69cc741935d80410f52d05056a34ecbebdc921c5f"
+    },
+    "tests/test_task_runtime.py": {
+      "importInputs": {
+        "tests/test_task_runtime.py": "49380e17c8291cf2a876fbf98008d57a100d088b322e0283bfbab4d3b4e9c572"
+      },
+      "origin": "adapted-import",
+      "sha256": "0001890778cbb75fe381c082b48508e3627789402f4bf4b14c069234cece2b44"
+    },
+    "tests/test_text_snapshot.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "9d01ff900885d54f7b59f05825a4e612b6b5b40e31adb378a0c3b3de76e41498"
+    }
+  },
+  "importTreeSha256": "c0191f17955a91ab25942d89956017417790b5e2540792116a199ba942056cc2",
+  "schemaVersion": 1
+}

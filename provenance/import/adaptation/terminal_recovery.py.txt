@@ -1,0 +1,715 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol, cast
+from sangrep_harness.review import CitationAdmissionV1, CoverageStateV1, ProviderCallStateV1, ReviewReceiptV1, ReviewReceiptV2, StructuralGrantV1, TerminalReviewResultV1
+from sangrep_harness.ports import ReviewPreflightV1, ReviewPreflightV2
+from sangrep_harness.wire import HARNESS_REVIEW_CONTRACT_ID, JsonValue, ReviewEventTypeV1, ReviewEventV1, ReviewStartV1, TerminalOutcomeV1, canonical_json_sha256_v1
+from sangrep_harness.diagnostics import ProviderFailureDiagnosticV1
+from sangrep_harness.providers.base import ProviderResponseFailureCodeV1
+from sangrep_harness.events import RunLeaseV1, build_review_event_v1
+from sangrep_harness.task_runtime import ReviewTaskSpecV1
+from sangrep_harness.events import RunLeaseV1
+from sangrep_harness.engine import responses_terminalized_event_payload_v2
+from sangrep_harness.reconcile import bridge_task_terminals_to_parent, build_parent_terminal_draft, reconcile_task_terminals
+
+
+class _ReviewTaskRecoveryStoreV1(Protocol):
+    def list_tasks(
+        self,
+        parent_run_id: str,
+        *,
+        parent_grant: StructuralGrantV1,
+    ) -> tuple[ReviewTaskSpecV1, ...]: ...
+
+    def list_terminals(
+        self,
+        parent_run_id: str,
+        *,
+        parent_grant: StructuralGrantV1,
+    ) -> tuple[ReviewTaskTerminalV1, ...]: ...
+
+    def child_run_id(self, task: ReviewTaskSpecV1) -> str | None: ...
+
+    def bind_terminal(
+        self,
+        task: ReviewTaskSpecV1,
+        *,
+        child_run_id: str,
+        failure_code: str | None,
+    ) -> ReviewTaskTerminalV1: ...
+
+    def root_contains(self, parent_root: object, child_root: object) -> bool: ...
+
+
+_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalReviewDraftV1:
+    """One pre-persistence terminal proposal with no caller-supplied identities."""
+
+    outcome: TerminalOutcomeV1
+    answer: str | None
+    citations: tuple[CitationAdmissionV1, ...]
+    evidence_gap_codes: tuple[str, ...]
+    inspected_count: int
+    unreviewed_count: int
+    coverage_state: CoverageStateV1
+    clarification_question_id: str | None
+    provider_call_state: ProviderCallStateV1
+    provider_failure_diagnostic: ProviderFailureDiagnosticV1 | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, TerminalOutcomeV1):
+            raise ValueError("terminal outcome is invalid")
+        if not isinstance(self.provider_call_state, ProviderCallStateV1):
+            raise ValueError("provider call state is invalid")
+        if type(self.citations) is not tuple or any(
+            type(citation) is not CitationAdmissionV1 for citation in self.citations
+        ):
+            raise ValueError("citations must be an immutable admitted tuple")
+        if type(self.evidence_gap_codes) is not tuple or any(
+            type(code) is not str or _CODE.fullmatch(code) is None
+            for code in self.evidence_gap_codes
+        ):
+            raise ValueError("evidence gap codes are invalid")
+        if len(set(self.evidence_gap_codes)) != len(self.evidence_gap_codes):
+            raise ValueError("evidence gap codes must be unique")
+        for value in (self.inspected_count, self.unreviewed_count):
+            if type(value) is not int or value < 0:
+                raise ValueError("terminal counts must be non-negative integers")
+        if not isinstance(self.coverage_state, CoverageStateV1):
+            raise ValueError("coverage state is invalid")
+        if self.coverage_state is CoverageStateV1.COMPLETE and self.unreviewed_count:
+            raise ValueError("complete coverage cannot retain unreviewed evidence")
+        if self.outcome is TerminalOutcomeV1.SUPPORTED_ANSWER:
+            if type(self.answer) is not str or not self.answer.strip() or not self.citations:
+                raise ValueError("supported answer requires text and admitted citations")
+        elif self.answer is not None or self.citations:
+            raise ValueError("only a supported answer may carry answer text or citations")
+        if self.outcome is TerminalOutcomeV1.CLARIFICATION_REQUIRED:
+            if type(self.clarification_question_id) is not str:
+                raise ValueError("clarification terminal requires a question")
+        elif self.clarification_question_id is not None:
+            raise ValueError("only clarification_required may carry a question")
+        if self.outcome is TerminalOutcomeV1.EVIDENCE_GAP and not self.evidence_gap_codes:
+            raise ValueError("evidence_gap requires at least one gap code")
+        if self.provider_failure_diagnostic is not None:
+            if type(self.provider_failure_diagnostic) is not ProviderFailureDiagnosticV1:
+                raise TypeError("provider_failure_diagnostic must use ProviderFailureDiagnosticV1")
+            if self.outcome is not TerminalOutcomeV1.PROVIDER_FAILED:
+                raise ValueError("only provider_failed may carry a provider failure diagnostic")
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsesTerminalAuthorityV1:
+    """Exact persisted Responses authority prefix used by one terminal receipt."""
+
+    physical_request_sha256: str | None
+    raw_response_sha256: str | None
+    continuation_sha256: str | None
+    provider_response_failure_code: ProviderResponseFailureCodeV1 | None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.physical_request_sha256,
+            self.raw_response_sha256,
+            self.continuation_sha256,
+        ):
+            if value is not None and (
+                type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
+                raise ValueError("Responses terminal authority digest is invalid")
+        if (
+            self.provider_response_failure_code is not None
+            and type(self.provider_response_failure_code) is not ProviderResponseFailureCodeV1
+        ):
+            raise TypeError("Responses terminal failure must use the closed enum")
+        if self.continuation_sha256 is not None and self.raw_response_sha256 is None:
+            raise ValueError("Responses continuation authority requires raw authority")
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedReviewTerminalV1:
+    """The exact terminal trio plus its resulting lease and recovery descriptor."""
+
+    result: TerminalReviewResultV1
+    receipt: ReviewReceiptV1 | ReviewReceiptV2
+    terminal_event: ReviewEventV1
+    lease: RunLeaseV1
+    recovery_reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        from sangrep_harness.events import RunLeaseV1
+
+        if (
+            type(self.result) is not TerminalReviewResultV1
+            or type(self.receipt) not in (ReviewReceiptV1, ReviewReceiptV2)
+            or type(self.terminal_event) is not ReviewEventV1
+            or type(self.lease) is not RunLeaseV1
+        ):
+            raise TypeError("persisted terminal values are invalid")
+        payload = self.terminal_event.payload.to_json_obj()
+        if (
+            self.receipt.run_id != self.result.run_id
+            or self.receipt.terminal_result_sha256 != self.result.digest
+            or self.receipt.pre_terminal_event_head_sha256
+            != self.result.pre_terminal_event_head_sha256
+            or self.terminal_event.run_id != self.result.run_id
+            or self.terminal_event.event_type is not ReviewEventTypeV1.TERMINAL
+            or self.terminal_event.previous_event_sha256
+            != self.result.pre_terminal_event_head_sha256
+            or not _terminal_event_matches(
+                payload,
+                result=self.result,
+                receipt=self.receipt,
+            )
+            or self.lease.run_id != self.result.run_id
+            or self.lease.expected_head_sequence != self.terminal_event.sequence
+            or self.lease.expected_head_sha256 != self.terminal_event.digest
+        ):
+            raise ValueError("persisted terminal identity chain is inconsistent")
+        if self.recovery_reason_code is not None and (
+            type(self.recovery_reason_code) is not str
+            or _CODE.fullmatch(self.recovery_reason_code) is None
+        ):
+            raise ValueError("terminal recovery reason is invalid")
+
+
+def build_terminalization_v1(
+    *,
+    lease: object,
+    draft: TerminalReviewDraftV1,
+    preflight: ReviewPreflightV1 | ReviewPreflightV2,
+    grant: StructuralGrantV1,
+    recovery_reason_code: str | None = None,
+    responses_authority: ResponsesTerminalAuthorityV1 | None = None,
+) -> PersistedReviewTerminalV1:
+    """Derive result, receipt, and terminal event without circular identities."""
+
+    from sangrep_harness.events import RunLeaseV1, build_review_event_v1
+
+    if type(lease) is not RunLeaseV1 or lease.expected_head_sha256 is None:
+        raise ValueError("terminalization requires a started run lease")
+    if type(draft) is not TerminalReviewDraftV1:
+        raise TypeError("draft must use TerminalReviewDraftV1")
+    if recovery_reason_code is not None and _CODE.fullmatch(recovery_reason_code) is None:
+        raise ValueError("recovery reason code is invalid")
+    receipt_seed_payload: dict[str, JsonValue] = {
+        "runId": lease.run_id,
+        "outcome": draft.outcome.value,
+        "preTerminalEventHeadSha256": lease.expected_head_sha256,
+    }
+    if draft.provider_failure_diagnostic is not None:
+        receipt_seed_payload["providerFailureDiagnostic"] = cast(
+            JsonValue, draft.provider_failure_diagnostic.to_json_obj()
+        )
+    receipt_seed = canonical_json_sha256_v1(receipt_seed_payload)
+    receipt_id = f"receipt-{receipt_seed[:32]}"
+    result = TerminalReviewResultV1(
+        run_id=lease.run_id,
+        outcome=draft.outcome,
+        answer=draft.answer,
+        citations=draft.citations,
+        grant_id=grant.grant_id,
+        grant_sha256=grant.digest,
+        evidence_gap_codes=draft.evidence_gap_codes,
+        inspected_count=draft.inspected_count,
+        unreviewed_count=draft.unreviewed_count,
+        coverage_state=draft.coverage_state,
+        clarification_question_id=draft.clarification_question_id,
+        pre_terminal_event_head_sha256=lease.expected_head_sha256,
+        receipt_id=receipt_id,
+        provider_failure_diagnostic=draft.provider_failure_diagnostic,
+    )
+    if type(preflight) is ReviewPreflightV2:
+        if type(responses_authority) is not ResponsesTerminalAuthorityV1:
+            raise ValueError("Responses terminalization requires its durable authority prefix")
+        receipt: ReviewReceiptV1 | ReviewReceiptV2 = ReviewReceiptV2(
+            receipt_id=receipt_id,
+            run_id=lease.run_id,
+            evidence_binding_sha256=grant.evidence_binding.digest,
+            grant_sha256=grant.digest,
+            context_sha256=preflight.context_binding.digest,
+            egress_policy_sha256=preflight.egress_policy.digest,
+            limits_sha256=preflight.limits.digest,
+            pre_terminal_event_head_sha256=lease.expected_head_sha256,
+            terminal_result_sha256=result.digest,
+            provider_call_state=draft.provider_call_state,
+            route_decision_sha256=preflight.route_decision_sha256,
+            route_policy_sha256=preflight.route_policy_sha256,
+            pricing_authority_sha256=preflight.pricing_authority_sha256,
+            provider_id=preflight.provider_id,
+            model_id=preflight.model_id,
+            provider_protocol_id=preflight.provider_protocol_id,
+            reasoning_effort=preflight.reasoning_effort,
+            physical_request_sha256=responses_authority.physical_request_sha256,
+            raw_response_sha256=responses_authority.raw_response_sha256,
+            continuation_sha256=responses_authority.continuation_sha256,
+            provider_response_failure_code=(responses_authority.provider_response_failure_code),
+        )
+        from sangrep_harness.engine import responses_terminalized_event_payload_v2
+
+        terminal_payload = cast(
+            dict[str, JsonValue],
+            responses_terminalized_event_payload_v2(
+                provider_id=preflight.provider_id,
+                model_id=preflight.model_id,
+                provider_protocol_id=preflight.provider_protocol_id,
+                reasoning_effort=preflight.reasoning_effort,
+                terminal_outcome=result.outcome,
+                provider_call_state=draft.provider_call_state,
+                failure_code=responses_authority.provider_response_failure_code,
+                receipt_sha256=receipt.digest,
+            ),
+        )
+    else:
+        if type(preflight) is not ReviewPreflightV1 or responses_authority is not None:
+            raise TypeError("Terminal preflight contract version is invalid")
+        receipt = ReviewReceiptV1(
+            receipt_id=receipt_id,
+            run_id=lease.run_id,
+            evidence_binding_sha256=grant.evidence_binding.digest,
+            grant_sha256=grant.digest,
+            context_sha256=preflight.context_binding.digest,
+            egress_policy_sha256=preflight.egress_policy.digest,
+            limits_sha256=preflight.limits.digest,
+            pre_terminal_event_head_sha256=lease.expected_head_sha256,
+            terminal_result_sha256=result.digest,
+            provider_call_state=draft.provider_call_state,
+            route_decision_sha256=preflight.route_decision_sha256,
+            route_policy_sha256=preflight.route_policy_sha256,
+            pricing_authority_sha256=preflight.pricing_authority_sha256,
+            provider_id=(
+                preflight.provider_id if preflight.route_decision_sha256 is not None else None
+            ),
+            model_id=(preflight.model_id if preflight.route_decision_sha256 is not None else None),
+        )
+        terminal_payload = {
+            "outcome": result.outcome.value,
+            "terminalResultSha256": result.digest,
+            "receiptSha256": receipt.digest,
+        }
+    event = build_review_event_v1(
+        lease,
+        event_id=f"event-{lease.run_id}-terminal",
+        event_type=ReviewEventTypeV1.TERMINAL,
+        payload=terminal_payload,
+    )
+    return PersistedReviewTerminalV1(
+        result=result,
+        receipt=receipt,
+        terminal_event=event,
+        lease=RunLeaseV1.from_event(event),
+        recovery_reason_code=recovery_reason_code,
+    )
+
+
+def _terminal_event_matches(
+    payload: dict[str, JsonValue],
+    *,
+    result: TerminalReviewResultV1,
+    receipt: ReviewReceiptV1 | ReviewReceiptV2,
+) -> bool:
+    if type(receipt) is ReviewReceiptV2:
+        return (
+            payload.get("schemaVersion") == 2
+            and payload.get("terminalOutcome") == result.outcome.value
+            and payload.get("providerCallState") == receipt.provider_call_state.value
+            and payload.get("failureCode")
+            == (
+                None
+                if receipt.provider_response_failure_code is None
+                else receipt.provider_response_failure_code.value
+            )
+            and payload.get("receiptSha256") == receipt.digest
+        )
+    return (
+        payload.get("terminalResultSha256") == result.digest
+        and payload.get("receiptSha256") == receipt.digest
+    )
+
+
+class CancellationRegistry:
+    """Append one actor-bound cancellation event and terminalize it idempotently."""
+
+    __slots__ = ("_grant", "_ledger", "_preflight")
+
+    def __init__(
+        self,
+        ledger: ReviewRunLedger,
+        *,
+        preflight: ReviewPreflightV1,
+        grant: StructuralGrantV1,
+    ) -> None:
+        self._ledger = ledger
+        self._preflight = preflight
+        self._grant = grant
+
+    def request(
+        self,
+        lease: RunLeaseV1,
+        *,
+        actor_id: str,
+        inspected_count: int,
+        unreviewed_count: int,
+    ) -> PersistedReviewTerminalV1:
+        if type(actor_id) is not str or not actor_id.strip():
+            raise ValueError("cancellation actor is required")
+        cancellation_identity = canonical_json_sha256_v1(
+            {"actorId": actor_id, "head": lease.expected_head_sequence}
+        )
+        cancellation_lease = self._ledger.append(
+            lease,
+            event_id=(f"event-{lease.run_id}-cancel-{cancellation_identity[:16]}"),
+            event_type=ReviewEventTypeV1.CANCELLATION_REQUESTED,
+            payload={
+                "actorId": actor_id,
+                "expectedEventHead": lease.expected_head_sequence,
+            },
+        )
+        return self._ledger.terminalize(
+            cancellation_lease,
+            TerminalReviewDraftV1(
+                outcome=TerminalOutcomeV1.CANCELLED,
+                answer=None,
+                citations=(),
+                evidence_gap_codes=(),
+                inspected_count=inspected_count,
+                unreviewed_count=unreviewed_count,
+                coverage_state=(
+                    CoverageStateV1.PARTIAL
+                    if inspected_count or unreviewed_count
+                    else CoverageStateV1.NOT_ASSESSED
+                ),
+                clarification_question_id=None,
+                provider_call_state=ProviderCallStateV1.NOT_REQUESTED,
+            ),
+            preflight=self._preflight,
+            grant=self._grant,
+        )
+
+    def is_cancelled(self, run_id: str) -> bool:
+        return self._ledger.is_cancellation_requested(run_id)
+
+
+class ReviewRunRecoveryService:
+    """Terminalize nonterminal work after a service crash without inventing success."""
+
+    __slots__ = ("_authority_resolver", "_ledger")
+
+    def __init__(
+        self,
+        ledger: ReviewRunLedger,
+        *,
+        authority_resolver: Callable[
+            [str],
+            tuple[ReviewPreflightV1, StructuralGrantV1],
+        ],
+    ) -> None:
+        if not callable(authority_resolver):
+            raise TypeError("recovery authority resolver must be callable")
+        self._ledger = ledger
+        self._authority_resolver = authority_resolver
+
+    def recover_nonterminal_runs(
+        self,
+        *,
+        root_run_id: str | None = None,
+    ) -> tuple[PersistedReviewTerminalV1, ...]:
+        run_ids = self._ledger.repository.list_nonterminal_run_ids()
+        task_authority = self._task_authority()
+        if task_authority is None:
+            selected = (
+                run_ids
+                if root_run_id is None
+                else tuple(run_id for run_id in run_ids if run_id == root_run_id)
+            )
+            return tuple(self._recover_one(run_id) for run_id in selected)
+        tasks, parent_run_id = task_authority
+        selected = self._scoped_run_ids(run_ids, parent_run_id, root_run_id)
+        children = tuple(run_id for run_id in selected if parent_run_id(run_id) is not None)
+        parents = tuple(run_id for run_id in selected if parent_run_id(run_id) is None)
+        recovered: list[PersistedReviewTerminalV1] = []
+        for child_run_id in children:
+            terminal = self._recover_one(child_run_id)
+            recovered.append(terminal)
+            self._bind_child_terminal(tasks, parent_run_id, child_run_id, terminal)
+        for parent_id in parents:
+            parent_preflight, parent_grant = self._authority_resolver(parent_id)
+            admitted = tasks.list_tasks(parent_id, parent_grant=parent_grant)
+            if not admitted:
+                recovered.append(self._recover_one(parent_id))
+                continue
+            for task in admitted:
+                task_child_run_id = tasks.child_run_id(task)
+                if task_child_run_id is None:
+                    if not self._ledger.repository.is_unfinished_legacy_gpt55_run(parent_id):
+                        raise RuntimeError("admitted recovery task has no durable child run")
+                    child_preflight = self._prepare_legacy_recovery_preflight(
+                        parent_preflight,
+                        task,
+                    )
+                    child_lease = self._ledger.start_child(
+                        task,
+                        _legacy_recovery_start(task, child_preflight),
+                        preflight=child_preflight,
+                        created_by="review-recovery",
+                    )
+                    child_terminal = self._terminalize_recovery_run(
+                        child_lease.run_id,
+                        child_preflight,
+                        task.grant,
+                    )
+                    recovered.append(child_terminal)
+                    task_child_run_id = child_lease.run_id
+                else:
+                    child_terminal = self._ledger.get_terminal(
+                        task_child_run_id,
+                        grant=task.grant,
+                    )
+                tasks.bind_terminal(
+                    task,
+                    child_run_id=task_child_run_id,
+                    failure_code=child_terminal.recovery_reason_code,
+                )
+            recovered.append(
+                self._recover_parent_from_children(
+                    parent_id,
+                    parent_preflight,
+                    parent_grant,
+                    tasks,
+                    admitted,
+                )
+            )
+        return tuple(recovered)
+
+    def _recover_one(self, run_id: str) -> PersistedReviewTerminalV1:
+        preflight, grant = self._authority_resolver(run_id)
+        return self._terminalize_recovery_run(run_id, preflight, grant)
+
+    def _terminalize_recovery_run(
+        self,
+        run_id: str,
+        preflight: ReviewPreflightV1,
+        grant: StructuralGrantV1,
+    ) -> PersistedReviewTerminalV1:
+        cancelled = self._ledger.is_cancellation_requested(run_id)
+        policy_superseded = self._ledger.repository.is_unfinished_legacy_gpt55_run(run_id)
+        protocol_superseded = self._is_unfinished_legacy_gpt56_chat_run(run_id)
+        if cancelled:
+            outcome = TerminalOutcomeV1.CANCELLED
+            recovery_reason_code = "cancel_observed_recovery"
+        elif protocol_superseded:
+            outcome = TerminalOutcomeV1.PROTOCOL_SUPERSEDED
+            recovery_reason_code = "legacy_gpt56_chat_protocol_superseded"
+        elif policy_superseded:
+            outcome = TerminalOutcomeV1.POLICY_SUPERSEDED
+            recovery_reason_code = "legacy_gpt55_policy_superseded"
+        else:
+            outcome = TerminalOutcomeV1.ENGINE_FAILED
+            recovery_reason_code = "abandoned_run_recovery"
+        return self._ledger.terminalize(
+            self._ledger.current_lease(run_id),
+            TerminalReviewDraftV1(
+                outcome=outcome,
+                answer=None,
+                citations=(),
+                evidence_gap_codes=(),
+                inspected_count=0,
+                unreviewed_count=0,
+                coverage_state=CoverageStateV1.NOT_ASSESSED,
+                clarification_question_id=None,
+                provider_call_state=(
+                    self._protocol_recovery_provider_call_state(run_id)
+                    if protocol_superseded
+                    else self._ledger.provider_call_state(run_id)
+                ),
+            ),
+            preflight=preflight,
+            grant=grant,
+            recovery_reason_code=recovery_reason_code,
+        )
+
+    def _is_unfinished_legacy_gpt56_chat_run(self, run_id: str) -> bool:
+        predicate = getattr(
+            self._ledger.repository,
+            "is_unfinished_routed_gpt56_chat_run",
+            None,
+        )
+        if not callable(predicate):
+            return False
+        result = predicate(run_id)
+        if type(result) is not bool:
+            raise TypeError("legacy GPT-5.6 protocol predicate returned invalid authority")
+        return result
+
+    def _protocol_recovery_provider_call_state(self, run_id: str) -> ProviderCallStateV1:
+        resolver = getattr(
+            self._ledger.repository,
+            "protocol_recovery_provider_call_state",
+            None,
+        )
+        if not callable(resolver):
+            return self._ledger.provider_call_state(run_id)
+        result = resolver(run_id)
+        if type(result) is not ProviderCallStateV1:
+            raise TypeError("legacy GPT-5.6 provider-call state is invalid")
+        return result
+
+    def _task_authority(
+        self,
+    ) -> tuple[_ReviewTaskRecoveryStoreV1, Callable[[str], str | None]] | None:
+        task_store_factory = getattr(self._ledger.repository, "task_recovery_store", None)
+        parent_run_id = getattr(self._ledger.repository, "parent_run_id", None)
+        if not callable(task_store_factory) or not callable(parent_run_id):
+            return None
+        tasks = cast(_ReviewTaskRecoveryStoreV1, task_store_factory())
+        for method in (
+            "list_tasks",
+            "list_terminals",
+            "child_run_id",
+            "bind_terminal",
+            "root_contains",
+        ):
+            if not callable(getattr(tasks, method, None)):
+                raise TypeError("review task recovery store is incomplete")
+        return tasks, cast(Callable[[str], str | None], parent_run_id)
+
+    def _prepare_legacy_recovery_preflight(
+        self,
+        parent_preflight: ReviewPreflightV1,
+        task: ReviewTaskSpecV1,
+    ) -> ReviewPreflightV1:
+        prepare = getattr(
+            self._ledger.repository,
+            "prepare_legacy_recovery_preflight",
+            None,
+        )
+        if not callable(prepare):
+            raise TypeError("review run repository cannot prepare legacy recovery authority")
+        preflight = prepare(parent_preflight, task)
+        if type(preflight) is not ReviewPreflightV1:
+            raise TypeError("legacy recovery preflight authority is invalid")
+        return preflight
+
+    @staticmethod
+    def _scoped_run_ids(
+        run_ids: tuple[str, ...],
+        parent_run_id: Callable[[str], str | None],
+        root_run_id: str | None,
+    ) -> tuple[str, ...]:
+        if root_run_id is None:
+            return run_ids
+        selected: list[str] = []
+        for run_id in run_ids:
+            candidate: str | None = run_id
+            while candidate is not None and candidate != root_run_id:
+                candidate = parent_run_id(candidate)
+            if candidate == root_run_id:
+                selected.append(run_id)
+        return tuple(selected)
+
+    def _bind_child_terminal(
+        self,
+        tasks: _ReviewTaskRecoveryStoreV1,
+        parent_lookup: Callable[[str], str | None],
+        child_run_id: str,
+        terminal: PersistedReviewTerminalV1,
+    ) -> None:
+        parent_run_id = parent_lookup(child_run_id)
+        if parent_run_id is None:
+            raise RuntimeError("child recovery run has no durable parent")
+        _, parent_grant = self._authority_resolver(parent_run_id)
+        matches = tuple(
+            task
+            for task in tasks.list_tasks(parent_run_id, parent_grant=parent_grant)
+            if tasks.child_run_id(task) == child_run_id
+        )
+        if len(matches) != 1:
+            raise RuntimeError("child recovery run does not match one admitted task")
+        tasks.bind_terminal(
+            matches[0],
+            child_run_id=child_run_id,
+            failure_code=terminal.recovery_reason_code,
+        )
+
+    def _recover_parent_from_children(
+        self,
+        parent_run_id: str,
+        parent_preflight: ReviewPreflightV1,
+        parent_grant: StructuralGrantV1,
+        tasks: _ReviewTaskRecoveryStoreV1,
+        admitted: tuple[ReviewTaskSpecV1, ...],
+    ) -> PersistedReviewTerminalV1:
+        from sangrep_harness.reconcile import (
+            bridge_task_terminals_to_parent,
+            build_parent_terminal_draft,
+            reconcile_task_terminals,
+        )
+
+        parent = self._ledger.current_lease(parent_run_id)
+        terminals = tasks.list_terminals(parent_run_id, parent_grant=parent_grant)
+        reconciled = reconcile_task_terminals(parent, admitted, terminals)
+        bridge = bridge_task_terminals_to_parent(
+            parent,
+            parent_grant,
+            admitted,
+            terminals,
+            ledger=self._ledger,
+            root_contains=tasks.root_contains,
+        )
+        policy_superseded = self._ledger.repository.is_unfinished_legacy_gpt55_run(parent_run_id)
+        protocol_superseded = self._is_unfinished_legacy_gpt56_chat_run(parent_run_id)
+        cancelled = self._ledger.is_cancellation_requested(parent_run_id)
+        draft = build_parent_terminal_draft(reconciled, bridge)
+        if cancelled or draft.outcome is TerminalOutcomeV1.CANCELLED:
+            recovery_reason_code = "cancel_observed_recovery"
+        elif protocol_superseded or draft.outcome is TerminalOutcomeV1.PROTOCOL_SUPERSEDED:
+            recovery_reason_code = "legacy_gpt56_chat_protocol_superseded"
+        elif policy_superseded or draft.outcome is TerminalOutcomeV1.POLICY_SUPERSEDED:
+            recovery_reason_code = "legacy_gpt55_policy_superseded"
+        else:
+            recovery_reason_code = "abandoned_run_recovery"
+        return self._ledger.terminalize(
+            bridge.lease,
+            draft,
+            preflight=parent_preflight,
+            grant=parent_grant,
+            recovery_reason_code=recovery_reason_code,
+        )
+
+
+def _legacy_recovery_start(
+    task: ReviewTaskSpecV1,
+    preflight: ReviewPreflightV1,
+) -> ReviewStartV1:
+    from sangrep_harness.task_runtime import ReviewTaskSpecV1
+
+    if type(task) is not ReviewTaskSpecV1 or type(preflight) is not ReviewPreflightV1:
+        raise TypeError("legacy recovery start requires frozen task and preflight authority")
+    payload: dict[str, JsonValue] = {
+        "question": preflight.question,
+        "evidenceRoots": [root.to_json_obj() for root in task.grant.evidence_roots],
+        "grantId": task.grant.grant_id,
+        "grantSha256": task.grant.digest,
+        "contextSha256": preflight.context_binding.digest,
+        "egressPolicySha256": preflight.egress_policy.digest,
+        "limitsSha256": preflight.limits.digest,
+        "clarificationMode": preflight.context_binding.clarification_mode.value,
+        "evaluatorSuiteId": preflight.local_evaluator_identity.profile_version,
+    }
+    return ReviewStartV1.from_json_obj(
+        {
+            "schemaVersion": 1,
+            "kind": "reviewCommand",
+            "contractId": HARNESS_REVIEW_CONTRACT_ID,
+            "method": "review.start",
+            "requestId": f"request-{preflight.preflight_id}",
+            "payload": payload,
+            "payloadSha256": canonical_json_sha256_v1(payload),
+        }
+    )

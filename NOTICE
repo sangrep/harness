@@ -1,5 +1,17 @@
 sangrep/harness
 
-This foundation contains governance and verification scaffolding only. Repository-specific
-copyright, attribution, third-party, trademark, and generated-artifact notices must be completed
-and reviewed before publication.
+This development component contains repository-owned integration code, documentation,
+synthetic examples and tests, and generic engine source admitted through a reviewed
+sanitized one-time import. Exact import provenance and compatibility information
+belong in provenance/ and ORIGIN.md.
+
+Approved license intent: AGPL-3.0-or-later OR LicenseRef-Sangrep-Commercial.
+A commercial license requires a separate Sangrep agreement. No trademark rights,
+service entitlement, support commitment or contributor-rights acceptance is implied.
+The LICENSE publication gate remains in force; technical checks do not satisfy it.
+
+The separately consumed sangrep-contracts artifact is licensed Apache-2.0 and is not
+vendored into this package. Its immutable identity is recorded in
+provenance/contracts-v1.json. Development dependencies remain separately distributed
+under their own licenses. The AGPL text is reproduced from the Free Software
+Foundation's public license text; see provenance/repository-v1.json.

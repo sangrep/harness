@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+command -v uv >/dev/null || { printf 'bootstrap: uv is required\n' >&2; exit 1; }
+uv venv --python 3.11 .venv --quiet
+uv pip install --python .venv/bin/python --require-hashes -r requirements-dev.txt --quiet
+.venv/bin/python scripts/bootstrap-contracts "$@"
+uv pip install --python .venv/bin/python --no-deps work/dependencies/sangrep_contracts-0.1.0.dev0-py3-none-any.whl --quiet
+if ! .venv/bin/python -m build --wheel --no-isolation --outdir work/install >/dev/null 2>&1; then
+  printf 'bootstrap: component-wheel-build-failed\n' >&2
+  exit 1
+fi
+uv pip install --python .venv/bin/python --no-deps work/install/sangrep_harness-0.1.0.dev0-py3-none-any.whl --quiet
+printf 'bootstrap: ready; activate .venv before running checks\n'

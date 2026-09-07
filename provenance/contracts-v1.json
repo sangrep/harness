@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "sangrep-contracts",
+  "version": "0.1.0.dev0",
+  "sourceCommit": "28f6d9ada5b2da9fb432aead11462104207750c0",
+  "sourceUrl": "https://codeload.github.com/sangrep/contracts/tar.gz/28f6d9ada5b2da9fb432aead11462104207750c0",
+  "sourceSha256": "30a284d0d978cd036f7ccd789f1b6223fc409df257838115dd1b668e570e2e6e",
+  "wheelName": "sangrep_contracts-0.1.0.dev0-py3-none-any.whl",
+  "wheelSha256": "8b6e52f4fb6db1ee021c7111cd17021577d9deb20ba7167622456a1bd329423c",
+  "wheelBytes": 95679,
+  "license": "Apache-2.0",
+  "buildBackend": "hatchling==1.32.0",
+  "registryReleaseClaimed": false
+}

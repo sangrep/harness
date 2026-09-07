@@ -289,13 +289,13 @@ def _scan_git_repository(directory: Path) -> tuple[list[Finding], dict[str, Any]
                 continue
             metadata, raw_path = entry.split(b"\t", 1)
             mode, kind, oid = metadata.split()
+            if mode not in {b"100644", b"100755"} or kind != b"blob":
+                raise HostedAuditError("repository-history-mode-unsupported")
             if (oid, raw_path) in seen:
                 continue
             seen.add((oid, raw_path))
             source = f"history-blob:{oid.decode()}:{hashlib.sha256(raw_path).hexdigest()}"
             findings.extend(scan_bytes(raw_path, source=source + ":path"))
-            if mode not in {b"100644", b"100755"} or kind != b"blob":
-                raise HostedAuditError("repository-history-mode-unsupported")
             if oid not in blobs:
                 size = int(_git(directory, ["cat-file", "-s", oid.decode()]))
                 budget.admit(size)

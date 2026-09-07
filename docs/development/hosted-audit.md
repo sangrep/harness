@@ -35,7 +35,11 @@ python scripts/audit-public-hosted-metadata \
   extracting members to disk. Each outer archive is limited to 64 MiB input,
   128 MiB total expanded content, 10,000 members and four nested levels. Paths,
   links, duplicate members, nonempty directories, comments, unknown binary files
-  and prohibited file types remain checked. ZIP extra fields are currently refused.
+  and prohibited file types remain checked. ZIP local records, central records and
+  the footer must account for the envelope; preambles, trailers, gaps and truncated
+  original names are refused. ZIP extra fields are currently refused. TAR header
+  fields are scanned, decoded framing counts against the expansion budget, and
+  termination padding must be zero. Gzip wrappers permit no unaccounted trailer.
 - Workflow-log projection recognizes only the established GitHub runner roots,
   rejects parent traversal and lookalikes, and preserves secret scanning. The
   timestamped setup-uv cache-glob message has a specific comma-list normalization;

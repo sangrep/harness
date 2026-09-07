@@ -1,5 +1,6 @@
 """Offline hosted-audit recovery probes use synthetic metadata and archive bytes."""
 
+import gzip
 import importlib.util
 import io
 import json
@@ -189,6 +190,97 @@ def test_archive_comments_are_scanned(audit):
     assert {finding.category for finding in findings} == {"github-token"}
 
 
+@pytest.mark.parametrize(
+    "case", ["zip-preamble", "zip-trailer", "zip-nul-name", "tar-owner", "tar-trailer"]
+)
+def test_review_archive_regions_cannot_return_clean(audit, case):
+    marker = b"ghp_" + b"a" * 24
+    if case.startswith("zip"):
+        name = "safe.txt-" + marker.decode()
+        payload = zip_bytes({name if case == "zip-nul-name" else "safe.txt": b"Public"})
+        if case == "zip-nul-name":
+            payload = payload.replace(name.encode(), b"safe.txt\0" + marker)
+        elif case == "zip-preamble":
+            payload = marker + payload
+        else:
+            payload += marker
+        archive_name = "a.zip"
+    else:
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            member = tarfile.TarInfo("safe.txt")
+            member.size = 6
+            member.uname = marker.decode() if case == "tar-owner" else ""
+            archive.addfile(member, io.BytesIO(b"Public"))
+        payload = stream.getvalue() + (marker if case == "tar-trailer" else b"")
+        archive_name = "a.tar"
+    from hosted_audit_content import ContentAuditError, scan_archive
+
+    try:
+        findings, _ = scan_archive(payload, source="review-envelope", name=archive_name)
+    except ContentAuditError:
+        return
+    assert findings, "An archive containing the synthetic marker must not receive a clean receipt"
+
+
+def test_review_streamed_zip_and_wheel_remain_supported(audit):
+    class Stream(io.BytesIO):
+        def seek(self, *args):
+            raise OSError("non-seekable test stream")
+
+    stream = Stream()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.comment = b"Public archive comment"
+        archive.writestr("example.whl", zip_bytes({"example/__init__.py": b"public = True"}))
+    payload = stream.getvalue()
+    findings, receipt = audit._scan_zip(payload, source="streamed-artifact")
+    assert findings == []
+    assert receipt["entries"][0]["children"]
+
+
+@pytest.mark.parametrize("format", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT])
+def test_review_pages_tar_formats_keep_long_names_and_metadata(format):
+    from hosted_audit_content import scan_archive
+
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w", format=format) as archive:
+        root = tarfile.TarInfo(".")
+        root.type = tarfile.DIRTYPE
+        root.uname, root.gname = "runner", "docker"
+        archive.addfile(root)
+        member = tarfile.TarInfo("./assets/" + "a" * 120 + ".txt")
+        member.size, member.mtime = 6, 1.5
+        member.uname, member.gname = "runner", "docker"
+        archive.addfile(member, io.BytesIO(b"Public"))
+    data = stream.getvalue()
+    for payload, name in [(data, "artifact.tar"), (gzip.compress(data), "artifact.tar.gz")]:
+        findings, receipt = scan_archive(payload, source="pages-format-control", name=name)
+        assert findings == []
+        assert receipt["entries"][0]["bytes"] == 6
+
+
+def test_review_gzip_tar_padding_and_trailers_are_bounded(monkeypatch):
+    import hosted_audit_content as content
+
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        member = tarfile.TarInfo("safe.txt")
+        member.size = 6
+        archive.addfile(member, io.BytesIO(b"Public"))
+    marker = b"ghp_" + b"a" * 24
+    for payload in [
+        gzip.compress(stream.getvalue() + marker),
+        gzip.compress(stream.getvalue()) + marker,
+    ]:
+        with pytest.raises(content.ContentAuditError):
+            content.scan_archive(payload, source="gzip-envelope", name="artifact.tar.gz")
+    monkeypatch.setattr(content, "MAX_EXPANDED_BYTES", 1024)
+    with pytest.raises(content.ContentAuditError, match="archive-budget-exceeded"):
+        content.scan_archive(
+            gzip.compress(stream.getvalue()), source="tar-padding-budget", name="artifact.tar.gz"
+        )
+
+
 def test_unknown_zip_extra_fields_are_refused(audit):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as archive:
@@ -275,6 +367,54 @@ def test_git_history_includes_deleted_files_and_nondefault_branches(audit, tmp_p
     tagged_findings, tagged_receipt = audit._scan_git_repository(repo)
     assert len([f for f in tagged_findings if f.category == "github-token"]) == 2
     assert tagged_receipt["annotatedTags"] == 1
+
+
+def test_review_older_symlink_is_validated_before_blob_path_reuse(audit, tmp_path):
+    def git(*arguments):
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.com",
+                *arguments,
+            ],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        ).stdout
+
+    git("init", "-b", "master")
+    path = tmp_path / "entry"
+    path.symlink_to("safe.txt")
+    git("add", "entry")
+    git("commit", "-m", "Synthetic link")
+    with pytest.raises(audit.HostedAuditError, match="repository-history-mode-unsupported"):
+        audit._scan_git_repository(tmp_path)
+
+    path.unlink()
+    path.write_text("safe.txt")
+    git("add", "entry")
+    git("commit", "-m", "Synthetic regular file")
+    with pytest.raises(audit.HostedAuditError, match="repository-history-mode-unsupported"):
+        audit._scan_git_repository(tmp_path)
+
+    # A separate reachable history containing only allowed mode changes still
+    # reuses the single payload; the rejected history above is not weakened.
+    git("checkout", "--orphan", "regular-control")
+    git("commit", "-m", "Regular control")
+    path.chmod(0o755)
+    git("add", "entry")
+    git("commit", "-m", "Executable regular control")
+    git("branch", "-D", "master")
+    findings, receipt = audit._scan_git_repository(tmp_path)
+    assert findings == []
+    assert (receipt["commits"], receipt["blobs"]) == (2, 1)
 
 
 def test_graphql_connection_scans_every_page(audit, monkeypatch):

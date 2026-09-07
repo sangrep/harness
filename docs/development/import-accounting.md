@@ -39,3 +39,9 @@ those boundaries, exposes immutable read-only properties, derives every text-vie
 member from validated snapshot records, and admits the public `notCitable` state.
 The neutral exchange-store `fail` operation supplies the caught-failure terminal
 contract; a typed `ProviderCallError` is tested to persist once and never resend.
+
+Review corrections add post-provider/per-tool/terminal deadline checkpoints and
+bind replay identity to immutable task/grant/evidence plus configured loop limits.
+Captured late responses keep their no-resend state; elapsed scheduling time remains
+outside replay identity. These corrections are local adaptations of the retained
+algorithms, with independent RED reproductions and focused regression coverage.

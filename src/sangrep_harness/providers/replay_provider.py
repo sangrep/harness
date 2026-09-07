@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sangrep_contracts import require_sha256
+
 from sangrep_harness.model import AgentModelRequest, AgentModelResponse
 from sangrep_harness.tools import HarnessToolRequest
 from sangrep_harness.wire import (
@@ -18,9 +20,17 @@ MAX_TRANSCRIPT_TURNS = 128
 
 
 def request_identity_v1(request: AgentModelRequest) -> str:
-    """Commit semantic request inputs; omit elapsed timeout used only for scheduling."""
+    """Bind the trusted task/grant/evidence and full declared limits with turn inputs.
+
+    The structural loop derives ``review_authority_sha256`` from its immutable
+    task and configured loop limits. Unbound headless requests are refused. Elapsed
+    timeout and process clock origin remain scheduling state and are not hashed.
+    """
     if type(request) is not AgentModelRequest or request.image_attachments:
         raise ValueError("headless-request-invalid")
+    if type(request.review_authority_sha256) is not str:
+        raise ValueError("headless-review-authority-required")
+    require_sha256(request.review_authority_sha256, field_name="review-authority")
     if any(
         turn.provider_state is not None
         or turn.private_provider_continuation is not None
@@ -31,6 +41,8 @@ def request_identity_v1(request: AgentModelRequest) -> str:
     return canonical_json_sha256_v1(
         freeze_json_object_v1(
             {
+                "profile": "harness.headless.request.v1",
+                "reviewAuthoritySha256": request.review_authority_sha256,
                 "conversation": [
                     {
                         "role": turn.role,
@@ -158,8 +170,6 @@ class ReplayProviderV1:
     """
 
     def __init__(self, turns: tuple[ReplayTurnV1, ...]) -> None:
-        from sangrep_contracts import require_sha256
-
         if type(turns) is not tuple or not 0 < len(turns) <= MAX_TRANSCRIPT_TURNS:
             raise ValueError("replay-transcript-invalid")
         for turn in turns:

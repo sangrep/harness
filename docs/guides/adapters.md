@@ -27,6 +27,10 @@ without grouping, repetition or backreferences.
 
 A provider is an `AgentModelCallable` receiving `AgentModelRequest`. The headless
 adapter requires bounded `AgentModelResponse` values with integer token usage.
+The structural loop sets `AgentModelRequest.review_authority_sha256` from the
+immutable task/grant/evidence and configured limits. Headless request identity
+rejects a missing or malformed commitment. Generic provider adapters may still use
+the request type without this headless-only field.
 Opaque continuations, images and live transport are outside this profile. Inherited
 provider protocol/egress value types remain available for separately reviewed
 integrations; they do not enable network access.

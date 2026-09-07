@@ -75,7 +75,7 @@
     "src/sangrep_harness/api.py": {
       "importInputs": {},
       "origin": "repository-owned",
-      "sha256": "2c4957782ee30d5ff7a7775bf9affc1c86afb42b6d6bec3dfc2944e87565e6b5"
+      "sha256": "38c0511e0125336c27d51a5172a9cf9519f69fc33b896e5f93529f89c82a85fe"
     },
     "src/sangrep_harness/citations.py": {
       "importInputs": {
@@ -179,7 +179,7 @@
         "src/sangrep_harness/model.py": "140026632ec52ec4c042bb20a0e2306c6ad560704f0c55beb452d8da7226cb3c"
       },
       "origin": "adapted-import",
-      "sha256": "8da0bcbc4a85cae34f8463403483e21e0471bdeb9cf051048026171537df111d"
+      "sha256": "945a534800c82f2a1b2c53e88594c2686e5b35ad9aee22ed701f651bbf675e8a"
     },
     "src/sangrep_harness/ports.py": {
       "importInputs": {
@@ -236,7 +236,7 @@
     "src/sangrep_harness/providers/replay_provider.py": {
       "importInputs": {},
       "origin": "repository-owned",
-      "sha256": "4072ef37bb1679ef3c411269ddade6735f08bfec3750a4f299f468f0b418727f"
+      "sha256": "137ce9fb3151c01670b92f514d035c266929ae555c6afdb97548bd564f4d2a7e"
     },
     "src/sangrep_harness/py.typed": {
       "importInputs": {},
@@ -276,7 +276,7 @@
         "adaptation/structural_loop.py.txt": "9a9dd0b1626ecdc5e4a3538b736309807f7a672a97545e9b5cb29b8149fa6551"
       },
       "origin": "adapted-import",
-      "sha256": "68a91ecfec0ba3fb0e89a69d633032cd34e6ca2d4642f0b4e7cd6a94a141c7aa"
+      "sha256": "b39a699bc4e53ab3866232b8538b29600a9a353efef3a4d815ec21a96c89031e"
     },
     "src/sangrep_harness/task_orchestration.py": {
       "importInputs": {
@@ -324,7 +324,7 @@
         "src/sangrep_harness/tools.py": "8be437a4daa444bc6042abd96c40ef7c9ddc1274fc8a6d074c5e0839ca10ae67"
       },
       "origin": "adapted-import",
-      "sha256": "34d8d39c488bd2a1e054baf353d8560b8dc4c686a76a089f6db8fd699c84eb53"
+      "sha256": "749ce213a24c5cb421642ecb0f7672606a986cac335841559d11c99995f656e7"
     },
     "src/sangrep_harness/wire.py": {
       "importInputs": {
@@ -393,7 +393,7 @@
     "tests/test_headless_review.py": {
       "importInputs": {},
       "origin": "repository-owned",
-      "sha256": "2ce665ac374e52fcb34899d83859347edb93b354c15a8b71206110e752555127"
+      "sha256": "b75d85978d9d7beb4c55627b9d5422736465259e3f7007f8642ce428cf4ec3c9"
     },
     "tests/test_provider_exchange.py": {
       "importInputs": {},
@@ -416,6 +416,11 @@
       },
       "origin": "adapted-import",
       "sha256": "229496a8f28d6e0be2f511ba37e43e2e09259041909cf8c2cdcd812aa2c00c4d"
+    },
+    "tests/test_review_deadline_authority_regressions.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "855d4ed2951d0e7899725e0e1a3e4cfeee90846b4abb5e682cf3375ebe6868da"
     },
     "tests/test_run_recovery.py": {
       "importInputs": {},

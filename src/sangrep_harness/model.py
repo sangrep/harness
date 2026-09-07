@@ -63,6 +63,9 @@ class AgentModelRequest:
     max_output_tokens: int | None = None
     admitted_max_tool_calls: int | None = None
     remaining_tool_calls: int | None = None
+    # The headless engine commits its frozen task (run, grant and evidence) and
+    # all configured loop limits. Generic provider adapters may leave this unset.
+    review_authority_sha256: str | None = None
 
     def __repr__(self) -> str:
         return (

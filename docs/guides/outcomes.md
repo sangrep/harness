@@ -27,6 +27,15 @@ These repositories lose state when the process exits. They do not provide durabl
 crash/reopen guarantees. A durable implementation must atomically implement the
 explicit ports and pass separate populated-state and crash/failure tests.
 
+A provider callback can return after its allotted time because Python callbacks
+are cooperatively bounded. The engine keeps captured provider output and its send
+reservation, then refuses late work with `budget_exhausted`. It checks the effective
+absolute deadline after provider return, before every tool execution, after returned
+tool work and immediately before terminal proposal admission. Late content cannot
+become a supported answer or grant a later tool call. This does not imply forced
+interruption of a blocking callback. A same-run retry retains the budget terminal
+and does not repeat the provider send.
+
 The retained task orchestrator prepares child run-start events before workers may
 act. A previously prepared batch recovers through terminal bindings and parent
 reconciliation, never by running workers again.

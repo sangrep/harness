@@ -8,7 +8,12 @@ from typing import Protocol
 from sangrep_harness.citations import extract_stable_id_citations
 from sangrep_harness.containment import validate_citations_within_structural_grant
 from sangrep_harness.engine import HarnessTaskExecutionV1
-from sangrep_harness.grants import SuccessfulToolCallV1, ToolEvidenceSupportV1
+from sangrep_harness.grants import (
+    GrantViolation,
+    GrantViolationCodeV1,
+    SuccessfulToolCallV1,
+    ToolEvidenceSupportV1,
+)
 from sangrep_harness.model import (
     AgentConversationTurn,
     AgentModelRequest,
@@ -30,7 +35,7 @@ from sangrep_harness.tools import (
     HarnessToolRequest,
     HarnessToolResult,
 )
-from sangrep_harness.wire import TerminalOutcomeV1
+from sangrep_harness.wire import TerminalOutcomeV1, canonical_json_sha256_v1
 
 MonotonicClock = Callable[[], float]
 
@@ -85,10 +90,22 @@ def execute_structural_review_task_v1(
             grant=grant,
             provider_call_state=ProviderCallStateV1.NOT_REQUESTED,
         )
+    deadline_at = min(
+        execution.context.deadline_monotonic,
+        monotonic_clock() + execution.limits.deadline_seconds,
+    )
+
+    def require_deadline() -> None:
+        if monotonic_clock() >= deadline_at:
+            raise GrantViolation(
+                GrantViolationCodeV1.BUDGET_EXHAUSTED, "Run deadline is exhausted."
+            )
+
     tools = EvidenceReviewToolsV1(
         grant=grant,
         evidence_head=evidence_head,
         registry=AdmittedToolRegistryV1(),
+        execution_guard=require_deadline,
     )
     turn = turn_factory(tools)
     if not callable(turn):
@@ -113,10 +130,6 @@ def execute_structural_review_task_v1(
     total_tokens_out: int | None = None
     provider_name: str | None = None
     citation_repair_used = False
-    deadline_at = min(
-        execution.context.deadline_monotonic,
-        monotonic_clock() + execution.limits.deadline_seconds,
-    )
     for _iteration in range(1, execution.limits.max_iterations + 1):
         if execution.cancellation_requested():
             return _structural_failure_draft(
@@ -163,6 +176,16 @@ def execute_structural_review_task_v1(
             rendered_input=_render_conversation(tuple(conversation)),
             model=model_id,
             agent_name="evidence-review",
+            review_authority_sha256=canonical_json_sha256_v1(
+                {
+                    "taskSha256": execution.task.digest,
+                    "maxIterations": execution.limits.max_iterations,
+                    "maxToolCalls": execution.limits.max_tool_calls,
+                    "maxTotalTokens": execution.limits.max_total_tokens,
+                    # Bind the declared duration, never a process clock reading.
+                    "deadlineSeconds": float(execution.limits.deadline_seconds).hex(),
+                }
+            ),
             conversation=tuple(conversation),
             tool_definitions=tools.definitions,
             timeout_seconds=remaining,
@@ -178,6 +201,7 @@ def execute_structural_review_task_v1(
             ),
         )
         result = turn(request)
+        require_deadline()
         response = result.response
         tool_results = result.tool_results
         _validate_model_response(response)
@@ -248,7 +272,7 @@ def execute_structural_review_task_v1(
                 for call in tools.successful_tool_calls
                 for support in call.supports
             }
-            return TerminalReviewDraftV1(
+            draft = TerminalReviewDraftV1(
                 outcome=TerminalOutcomeV1.EVIDENCE_GAP,
                 answer=None,
                 citations=(),
@@ -259,6 +283,8 @@ def execute_structural_review_task_v1(
                 clarification_question_id=None,
                 provider_call_state=ProviderCallStateV1.COMPLETED,
             )
+            require_deadline()
+            return draft
         validation_error = structural_citation_validation_error(
             response.output,
             grant=grant,
@@ -309,7 +335,7 @@ def execute_structural_review_task_v1(
         }
         granted_count = len(evidence_head.granted_nodes(grant))
         unreviewed_count = max(0, granted_count - len(inspected))
-        return TerminalReviewDraftV1(
+        draft = TerminalReviewDraftV1(
             outcome=TerminalOutcomeV1.SUPPORTED_ANSWER,
             answer=response.output,
             citations=citations,
@@ -322,6 +348,8 @@ def execute_structural_review_task_v1(
             clarification_question_id=None,
             provider_call_state=ProviderCallStateV1.COMPLETED,
         )
+        require_deadline()
+        return draft
     return _structural_failure_draft(
         TerminalOutcomeV1.BUDGET_EXHAUSTED,
         evidence_head=evidence_head,

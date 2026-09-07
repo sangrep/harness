@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -330,7 +331,7 @@ class AdmittedToolRegistryV1:
 class EvidenceReviewToolsV1:
     """Projection-backed text tools with no authority beyond one structural grant."""
 
-    __slots__ = ("_evidence_head", "_grant", "_registry")
+    __slots__ = ("_evidence_head", "_grant", "_registry", "_execution_guard")
 
     @evidence_port_boundary
     def __init__(
@@ -339,6 +340,7 @@ class EvidenceReviewToolsV1:
         grant: StructuralGrantV1,
         evidence_head: ReviewEvidenceHeadV1,
         registry: AdmittedToolRegistryV1,
+        execution_guard: Callable[[], None] | None = None,
     ) -> None:
         if type(registry) is not AdmittedToolRegistryV1:
             raise TypeError("registry must use AdmittedToolRegistryV1")
@@ -346,6 +348,18 @@ class EvidenceReviewToolsV1:
         self._grant = grant
         self._evidence_head = evidence_head
         self._registry = registry
+        if execution_guard is not None and not callable(execution_guard):
+            raise TypeError("execution_guard must be callable")
+        self._execution_guard = execution_guard
+
+    def require_execution_authority(self) -> None:
+        """Enforce the engine's transient execution guard without expanding a grant.
+
+        The structural loop installs its effective absolute deadline here. Direct
+        standalone tool users have no run clock unless they supply this guard.
+        """
+        if self._execution_guard is not None:
+            self._execution_guard()
 
     @property
     def definitions(self) -> tuple[HarnessToolDefinition, ...]:
@@ -368,6 +382,7 @@ class EvidenceReviewToolsV1:
 
         if type(request) is not HarnessToolRequest:
             raise TypeError("request must use HarnessToolRequest")
+        self.require_execution_authority()
         authorization = self._registry.authorize(
             request.name,
             request.arguments,
@@ -378,6 +393,7 @@ class EvidenceReviewToolsV1:
         arguments = _ARGUMENT_MODELS[request.name].model_validate(
             authorization.arguments.to_json_obj()
         )
+        self.require_execution_authority()
         try:
             payload, supports = getattr(self, f"_execute_{request.name}")(arguments)
             if len(canonical_json_bytes_v1(freeze_json_object_v1(payload).to_json_obj())) > 65536:
@@ -394,6 +410,7 @@ class EvidenceReviewToolsV1:
                 payload={"errorCode": error.code.value},
                 projection_digest=self._grant.evidence_binding.projection_payload_sha256,
             )
+        self.require_execution_authority()
         citable_ids = tuple(dict.fromkeys(support.anchor_id for support in supports))
         result = HarnessToolResult(
             call_id=request.call_id,

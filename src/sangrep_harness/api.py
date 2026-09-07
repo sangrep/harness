@@ -219,10 +219,15 @@ def review_snapshot_v1(
                     "requestSha256": request_sha,
                 },
             )
+
+            def validate_execution() -> None:
+                head.require_grant(grant)
+                tools.require_execution_authority()
+
             normalized = gateway.complete(
                 f"{run_id}:turn:{len(transcript)}",
                 authority,
-                lambda: head.require_grant(grant),
+                validate_execution,
                 lambda: response_payload_v1(provider(request)).to_json_obj(),
             )
             transcript.append(ReplayTurnV1(request_sha, normalized))
@@ -236,6 +241,7 @@ def review_snapshot_v1(
                     "outputTokens": response.tokens_out,
                 },
             )
+            tools.require_execution_authority()
             if (response.tokens_in or 0) + (response.tokens_out or 0) > (
                 request.max_output_tokens or 0
             ):
@@ -243,7 +249,9 @@ def review_snapshot_v1(
                     GrantViolationCodeV1.BUDGET_EXHAUSTED,
                     "Provider usage exceeds remaining run budget.",
                 )
+            results: list[HarnessToolResult] = []
             for call in response.tool_calls:
+                tools.require_execution_authority()
                 event(
                     ReviewEventTypeV1.TOOL_REQUESTED,
                     {
@@ -255,8 +263,8 @@ def review_snapshot_v1(
                         "grantSha256": grant.digest,
                     },
                 )
-            results = tuple(tools.execute(call) for call in response.tool_calls)
-            for result in results:
+                result = tools.execute(call)
+                results.append(result)
                 if result.status != "succeeded":
                     event(
                         ReviewEventTypeV1.TOOL_FAILED,
@@ -277,7 +285,7 @@ def review_snapshot_v1(
                         "projectionRevisionId": snapshot.projection.projection_revision_id,
                     },
                 )
-            return _Turn(response, results)
+            return _Turn(response, tuple(results))
 
         return turn
 

@@ -79,6 +79,7 @@ def test_replay_binds_conversation_not_only_rendered_text():
         "Policy",
         "Rendered",
         "headless-v1",
+        review_authority_sha256="a" * 64,
         conversation=(AgentConversationTurn("user", "Original"),),
     )
     changed = replace(request, conversation=(AgentConversationTurn("user", "Changed"),))

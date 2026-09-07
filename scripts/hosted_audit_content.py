@@ -121,9 +121,64 @@ def _zip_envelope(payload: bytes, archive: zipfile.ZipFile) -> None:
         raise ContentAuditError("archive-zip-envelope-invalid")
 
 
+def _zip_member(payload: bytes, member: zipfile.ZipInfo) -> bytes:
+    """Decode exactly the accounted range, without ZipExtFile's truncation behavior."""
+    name_size, extra_size = struct.unpack_from("<2H", payload, member.header_offset + 26)
+    start = member.header_offset + 30 + name_size + extra_size
+    compressed = memoryview(payload)[start : start + member.compress_size]
+    if len(compressed) != member.compress_size:
+        raise ContentAuditError("archive-zip-member-invalid")
+    if member.compress_type == zipfile.ZIP_STORED:
+        if member.compress_size != member.file_size:
+            raise ContentAuditError("archive-zip-member-invalid")
+        data = bytes(compressed)
+    elif member.compress_type == zipfile.ZIP_DEFLATED:
+        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+        data = decoder.decompress(compressed, member.file_size + 1)
+        if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+            raise ContentAuditError("archive-zip-member-invalid")
+    else:
+        raise ContentAuditError("archive-compression-unsupported")
+    if len(data) != member.file_size or zlib.crc32(data) != member.CRC:
+        raise ContentAuditError("archive-zip-member-invalid")
+    return data
+
+
+def _pax_metadata(metadata: bytes) -> None:
+    """Allow ordinary metadata/path records, not payload reinterpretation."""
+    allowed = {
+        b"path",
+        b"linkpath",
+        b"uname",
+        b"gname",
+        b"uid",
+        b"gid",
+        b"mtime",
+        b"atime",
+        b"ctime",
+        b"comment",
+    }
+    position = 0
+    seen: set[bytes] = set()
+    while position < len(metadata):
+        space = metadata.find(b" ", position)
+        length_text = metadata[position:space]
+        if space < 0 or not length_text.isdigit():
+            raise ContentAuditError("archive-tar-metadata-unsupported")
+        end = position + int(length_text)
+        if end > len(metadata) or end <= space + 2 or metadata[end - 1 : end] != b"\n":
+            raise ContentAuditError("archive-tar-metadata-unsupported")
+        record = metadata[space + 1 : end - 1]
+        key, separator, _ = record.partition(b"=")
+        if not separator or key not in allowed or key in seen:
+            raise ContentAuditError("archive-tar-metadata-unsupported")
+        seen.add(key)
+        position = end
+
+
 def _tar_envelope(
     payload: bytes, *, source: str, name: str, budget: ArchiveBudget
-) -> tuple[bytes, list[Finding]]:
+) -> tuple[bytes, list[Finding], dict[int, tuple[int, bytes]]]:
     findings: list[Finding] = []
     available = MAX_EXPANDED_BYTES - budget.expanded
     if name.lower().endswith((".tar.gz", ".tgz")):
@@ -154,13 +209,14 @@ def _tar_envelope(
     budget.expanded += len(data)
     position = 0
     members = budget.members
+    framing: dict[int, tuple[int, bytes]] = {}
     metadata_types = {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME}
     while position + 512 <= len(data):
         header = data[position : position + 512]
         if not any(header):
             if len(data) - position < 1024 or len(data) % 512 or any(data[position:]):
                 raise ContentAuditError("archive-tar-envelope-invalid")
-            return data, findings
+            return data, findings, framing
         member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
         members += 1
         if members > MAX_MEMBERS or member.size < 0:
@@ -183,9 +239,13 @@ def _tar_envelope(
             metadata = data[start:end]
             if member.type == tarfile.GNUTYPE_LONGNAME:
                 metadata = metadata.rstrip(b"\0")
+            else:
+                _pax_metadata(metadata)
             findings.extend(scan_bytes(metadata, source=f"{source}:tar-metadata:{position}"))
         elif member.type not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}:
             raise ContentAuditError("archive-member-unsupported")
+        else:
+            framing[start] = (member.size, member.type)
         position = following
     raise ContentAuditError("archive-tar-envelope-invalid")
 
@@ -272,12 +332,16 @@ def scan_archive(
                 raise ContentAuditError("archive-path-invalid")
             seen.add(".")
             budget.admit(0)
+            if not prepaid:
+                read()
             return
         path = _member_path(member_name, seen)
         budget.admit(0 if prepaid else size)
         entry_source = f"{source}:{member_name}"
         findings.extend(scan_bytes(member_name.encode(), source=f"{entry_source}:path"))
         if directory:
+            if not prepaid:
+                read()
             return
         data = read()
         if len(data) != size:
@@ -317,21 +381,33 @@ def scan_archive(
                         kind not in {0, stat.S_IFREG, stat.S_IFDIR}
                         or member.flag_bits & 1
                         or member.extra
+                        or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
                     ):
                         raise ContentAuditError("archive-member-unsupported")
                     inspect(
                         member.filename,
                         member.file_size,
-                        lambda selected=member: archive.read(selected),
+                        lambda selected=member: _zip_member(payload, selected),
                         directory=member.is_dir(),
                     )
         elif name.lower().endswith((".tar", ".tar.gz", ".tgz")):
-            data, envelope_findings = _tar_envelope(
+            data, envelope_findings, framing = _tar_envelope(
                 payload, source=source, name=name, budget=budget
             )
             findings.extend(envelope_findings)
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
                 for member in archive:
+                    if member.sparse is not None:
+                        raise ContentAuditError("archive-tar-metadata-unsupported")
+                    if (
+                        member.size < 0
+                        or member.size > MAX_EXPANDED_BYTES
+                        or member.offset_data < 0
+                        or member.offset_data + member.size > len(data)
+                    ):
+                        raise ContentAuditError("archive-budget-exceeded")
+                    if framing.pop(member.offset_data, None) != (member.size, member.type):
+                        raise ContentAuditError("archive-tar-member-mismatch")
                     for key, value in member.pax_headers.items():
                         findings.extend(
                             scan_bytes(f"{key}={value}".encode(), source=source + ":pax")
@@ -340,12 +416,11 @@ def scan_archive(
                         raise ContentAuditError("archive-member-unsupported")
 
                     def read(selected=member):
-                        stream = archive.extractfile(selected)
-                        if stream is None:
-                            raise ContentAuditError("archive-member-unreadable")
-                        return stream.read(selected.size + 1)
+                        return data[selected.offset_data : selected.offset_data + selected.size]
 
                     inspect(member.name, member.size, read, directory=member.isdir(), prepaid=True)
+            if framing:
+                raise ContentAuditError("archive-tar-member-mismatch")
         else:
             raise ContentAuditError("archive-format-unsupported")
     except (

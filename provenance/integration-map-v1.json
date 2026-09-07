@@ -340,6 +340,11 @@
       "origin": "adapted-import",
       "sha256": "238025c235e2412fa96399f9442cf76a04c8594602edf4e437043c18df10dbae"
     },
+    "tests/test_archive_decoding.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "0feba22dea062c1208ee33fd9bd37129097190b10a5e0d994ba69beba73914ae"
+    },
     "tests/test_cli.py": {
       "importInputs": {},
       "origin": "repository-owned",

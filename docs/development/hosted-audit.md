@@ -40,6 +40,17 @@ python scripts/audit-public-hosted-metadata \
   original names are refused. ZIP extra fields are currently refused. TAR header
   fields are scanned, decoded framing counts against the expansion budget, and
   termination padding must be zero. Gzip wrappers permit no unaccounted trailer.
+- ZIP member decoding supports stored and deflate data only. Every member,
+  including a directory's empty payload, must match its declared size and CRC;
+  deflate must reach EOF and consume its entire accounted compressed range.
+  Other compression methods are refused. The output limit is admitted before
+  decoding, and decoding is capped at the declared size plus one overflow byte.
+- TAR supports ordinary GNU long names and PAX path, ownership, time and comment
+  metadata. PAX `size` overrides, sparse keys, duplicate keys within a header and
+  unrecognized extensions are refused during raw framing inspection, before opening the TAR
+  reader. Each parsed ordinary member must match the accounted size, type and
+  data offset; its bytes are sliced from that bounded raw span. Unmatched raw
+  members are refused. Prepaid framing never permits extra interpreted output.
 - Workflow-log projection recognizes only the established GitHub runner roots,
   rejects parent traversal and lookalikes, and preserves secret scanning. The
   timestamped setup-uv cache-glob message has a specific comma-list normalization;

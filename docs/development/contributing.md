@@ -30,4 +30,5 @@ skipped implementation check for acceptance. CI cancels superseded work.
 Documentation is built locally and as a CI artifact before any GitHub Pages
 publication. Preview it locally with `python -m mkdocs serve`. Deployment and
 publication need their own accepted gate; this implementation does not activate
-hosting or release automation.
+hosting or release automation. The separate [manual Pages workflow](pages.md)
+requires accepted master bytes and maintainer activation; it does not run on PRs.

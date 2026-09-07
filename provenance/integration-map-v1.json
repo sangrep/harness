@@ -395,6 +395,11 @@
       "origin": "repository-owned",
       "sha256": "b75d85978d9d7beb4c55627b9d5422736465259e3f7007f8642ce428cf4ec3c9"
     },
+    "tests/test_pages_delivery.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "cb678debc71f8ad9b615a011cd767ca73694e27be2b6775ef016d2af09141518"
+    },
     "tests/test_provider_exchange.py": {
       "importInputs": {},
       "origin": "repository-owned",

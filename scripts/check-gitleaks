@@ -165,6 +165,17 @@ run_scan() {
   : >"$scan_output"
 }
 
+# Manual Pages jobs have no PR/push history range. Scan only their exact generated
+# artifact with the same verified scanner; the ordinary repository mode is unchanged.
+if (( $# > 0 )); then
+  [[ $# == 1 && "$1" == "--docs-artifact" ]] || blocked invalid-scan-scope
+  [[ -d work/docs-site && ! -L work/docs-site && -f work/docs-site/index.html ]] || \
+    blocked docs-artifact-unavailable
+  run_scan dir --redact=100 --no-banner --no-color --log-level=error -- work/docs-site
+  printf 'docs-secret-scan: passed\n'
+  exit 0
+fi
+
 history_arguments=(git --redact=100 --no-banner --no-color --log-level=error)
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   if ! range=$(event_range); then

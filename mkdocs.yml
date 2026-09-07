@@ -53,6 +53,7 @@ nav:
   - Evaluation: evaluation.md
   - Development:
       - Contributing: development/contributing.md
+      - GitHub Pages delivery: development/pages.md
       - Licensing: development/licensing.md
       - Import accounting: development/import-accounting.md
       - Implementation: development/implementation.md

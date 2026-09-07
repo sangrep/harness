@@ -43,8 +43,10 @@ python -m mkdocs serve --dev-addr 127.0.0.1:8000
 MkDocs Material and mkdocstrings produce the concepts, guides and API reference.
 `./scripts/check-docs` creates a scanned local preview in `work/docs-site`. CI
 uploads this preview and the checked wheel as short-lived artifacts. GitHub Pages
-is the intended documentation destination; this repository does not deploy it as
-part of a PR check.
+is the intended documentation destination; preview artifacts do not establish live
+availability. The [manual Pages delivery workflow](docs/development/pages.md) is
+master-only and requires separate maintainer activation and HTTP/browser verification.
+PR checks never deploy documentation.
 
 ## Integration boundary
 

@@ -15,3 +15,8 @@ vendored into this package. Its immutable identity is recorded in
 provenance/contracts-v1.json. Development dependencies remain separately distributed
 under their own licenses. The AGPL text is reproduced from the Free Software
 Foundation's public license text; see provenance/repository-v1.json.
+
+The hosted-audit runner-path helper adapts Sangrep Contracts verification code.
+Copyright 2026 Sangrep contributors. That portion is licensed Apache-2.0; see
+LICENSES/Apache-2.0.txt, provenance/hosted-audit-reuse-v1.json and the retained
+upstream notice in provenance/hosted-audit-upstream-NOTICE.txt.

@@ -54,6 +54,7 @@ nav:
   - Development:
       - Contributing: development/contributing.md
       - GitHub Pages delivery: development/pages.md
+      - Hosted publication audit: development/hosted-audit.md
       - Licensing: development/licensing.md
       - Import accounting: development/import-accounting.md
       - Implementation: development/implementation.md

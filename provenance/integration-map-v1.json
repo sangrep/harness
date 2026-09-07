@@ -340,6 +340,11 @@
       "origin": "adapted-import",
       "sha256": "238025c235e2412fa96399f9442cf76a04c8594602edf4e437043c18df10dbae"
     },
+    "tests/test_archive_decoding.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "0feba22dea062c1208ee33fd9bd37129097190b10a5e0d994ba69beba73914ae"
+    },
     "tests/test_cli.py": {
       "importInputs": {},
       "origin": "repository-owned",
@@ -394,6 +399,11 @@
       "importInputs": {},
       "origin": "repository-owned",
       "sha256": "b75d85978d9d7beb4c55627b9d5422736465259e3f7007f8642ce428cf4ec3c9"
+    },
+    "tests/test_hosted_audit_recovery.py": {
+      "importInputs": {},
+      "origin": "repository-owned",
+      "sha256": "e9a913c0e5483afba82a8701a49caa612b24ce5cc54f58555568a2b567d73c06"
     },
     "tests/test_pages_delivery.py": {
       "importInputs": {},

@@ -9,13 +9,13 @@ import re
 import subprocess
 import sys
 import tempfile
-import zipfile
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
 
+from hosted_audit_content import ArchiveBudget, ContentAuditError, scan_archive  # noqa: E402
 from public_boundary_policy import (  # noqa: E402
     Finding,
     canonical_inventory_digest,
@@ -25,6 +25,7 @@ from public_boundary_policy import (  # noqa: E402
 SURFACES = {
     "artifacts",
     "attestations",
+    "attestationCoverage",
     "branches",
     "caches",
     "commits",
@@ -45,9 +46,11 @@ SURFACES = {
     "pullRequests",
     "pullReviewComments",
     "pullReviews",
+    "pullReviewThreads",
     "releaseAssets",
     "releases",
     "repository",
+    "repositoryHistory",
     "rulesets",
     "tags",
     "workflowJobs",
@@ -123,13 +126,22 @@ def _linked_attachment_urls(value: Any) -> set[str]:
 def _gh(arguments: list[str], *, binary: bool = False, allow_absent: bool = False) -> bytes:
     try:
         completed = subprocess.run(
-            ["gh", *arguments],
+            [
+                "gh",
+                arguments[0],
+                "--hostname",
+                "github.com",
+                "-H",
+                "X-GitHub-Api-Version: 2026-03-10",
+                *arguments[1:],
+            ],
             check=True,
             capture_output=True,
+            timeout=60,
         )
     except subprocess.CalledProcessError as error:
         stderr = error.stderr.decode("utf-8", errors="replace")
-        if allow_absent and ("HTTP 404" in stderr or "HTTP 409" in stderr):
+        if allow_absent and "HTTP 404" in stderr:
             return b"" if binary else b"null"
         raise HostedAuditError("GitHub hosted surface could not be inventoried") from error
     return completed.stdout
@@ -169,87 +181,340 @@ def _list(endpoint: str, *, collection_key: str | None = None) -> list[dict[str,
     return rows
 
 
-def _scan_zip(payload: bytes, *, source: str) -> tuple[list[Finding], dict[str, Any]]:
-    if len(payload) > 64 * 1024 * 1024:
-        raise HostedAuditError("hosted archive exceeds the audit download budget")
-    findings: list[Finding] = []
-    entries: list[dict[str, Any]] = []
-    with tempfile.TemporaryFile() as temporary:
-        temporary.write(payload)
-        temporary.seek(0)
-        try:
-            archive = zipfile.ZipFile(temporary)
-        except zipfile.BadZipFile as error:
-            raise HostedAuditError("hosted archive is not a valid ZIP") from error
-        total = 0
-        for info in archive.infolist():
-            path = PurePosixPath(info.filename)
-            if path.is_absolute() or ".." in path.parts or info.is_dir():
-                if not info.is_dir():
-                    raise HostedAuditError("hosted archive contains an unsafe path")
+def _scan_zip(
+    payload: bytes, *, source: str, repository: str = "sangrep/harness"
+) -> tuple[list[Finding], dict[str, Any]]:
+    try:
+        return scan_archive(
+            payload,
+            source=source,
+            log_repository=repository if source.startswith("workflow-log:") else None,
+        )
+    except ContentAuditError as error:
+        raise HostedAuditError(str(error)) from error
+
+
+def _collect_attestations(
+    repository: str, repository_id: int, subjects: list[str]
+) -> dict[str, Any]:
+    owner, name = repository.split("/")
+    try:
+        rows = _list(f"orgs/{owner}/attestations/repositories?per_page=100")
+    except HostedAuditError as error:
+        raise HostedAuditError("attestation-enumeration-unavailable") from error
+    seen: set[int] = set()
+    for row in rows:
+        identity = row.get("id")
+        if (
+            type(identity) is not int
+            or identity <= 0
+            or identity in seen
+            or not isinstance(row.get("name"), str)
+        ):
+            raise HostedAuditError("attestation-repository-inventory-invalid")
+        if (identity == repository_id) != (row["name"] == name):
+            raise HostedAuditError("attestation-repository-inventory-invalid")
+        seen.add(identity)
+    authority = {"authority": "authenticated-repository-enumeration", "repositoryId": repository_id}
+    if repository_id not in seen:
+        return {**authority, "complete": True, "attested": False, "subjects": []}
+    observations = []
+    for subject in sorted(set(subjects)):
+        if not re.fullmatch(r"[0-9a-f]{64}", subject):
+            raise HostedAuditError("attestation-subject-invalid")
+        records = _list(
+            f"repos/{repository}/attestations/sha256:{subject}?per_page=100",
+            collection_key="attestations",
+        )
+        observations.append({"subjectDigest": f"sha256:{subject}", "records": records})
+    # The endpoint enumerates attestations for one supplied digest, not every
+    # historical subject. Even empty subject responses cannot prove completeness.
+    return {
+        **authority,
+        "complete": False,
+        "attested": True,
+        "subjects": observations,
+        "reason": "unbounded-subject-inventory",
+    }
+
+
+def _git(directory: Path, arguments: list[str]) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(directory), *arguments],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise HostedAuditError("repository-history-unavailable") from error
+
+
+def _scan_git_repository(directory: Path) -> tuple[list[Finding], dict[str, Any]]:
+    if _git(directory, ["rev-parse", "--is-shallow-repository"]).strip() != b"false":
+        raise HostedAuditError("repository-history-incomplete")
+    commits = _git(directory, ["rev-list", "--all"]).splitlines()
+    if not commits or len(commits) > 10000:
+        raise HostedAuditError("repository-history-budget")
+    refs = _git(directory, ["for-each-ref", "--format=%(refname) %(objectname)"])
+    findings = scan_bytes(refs, source="repository-history:refs")
+    tag_objects: set[bytes] = set()
+    for root in _git(
+        directory, ["for-each-ref", "--format=%(objecttype) %(objectname)"]
+    ).splitlines():
+        kind, oid = root.split()
+        while kind == b"tag" and oid not in tag_objects:
+            if len(tag_objects) >= 10000:
+                raise HostedAuditError("repository-history-budget")
+            tag_objects.add(oid)
+            data = _git(directory, ["cat-file", "tag", oid.decode()])
+            findings.extend(scan_bytes(data, source=f"history-tag:{oid.decode()}"))
+            header = dict(line.split(b" ", 1) for line in data.split(b"\n\n", 1)[0].splitlines())
+            oid = header[b"object"]
+            kind = _git(directory, ["cat-file", "-t", oid.decode()]).strip()
+        if kind not in {b"commit", b"tag"}:
+            raise HostedAuditError("repository-history-tag-type-unsupported")
+    seen: set[tuple[bytes, bytes]] = set()
+    blobs: dict[bytes, bytes] = {}
+    budget = ArchiveBudget()
+    for commit in commits:
+        sha = commit.decode("ascii")
+        if not SHA_PATTERN.fullmatch(sha):
+            raise HostedAuditError("repository-history-incomplete")
+        findings.extend(
+            scan_bytes(_git(directory, ["cat-file", "commit", sha]), source=f"history-commit:{sha}")
+        )
+        for entry in _git(directory, ["ls-tree", "-r", "-z", sha]).split(b"\0"):
+            if not entry:
                 continue
-            total += info.file_size
-            if total > 128 * 1024 * 1024:
-                raise HostedAuditError("expanded hosted archive exceeds the audit budget")
-            data = archive.read(info)
-            entry_source = f"{source}:{info.filename}"
+            metadata, raw_path = entry.split(b"\t", 1)
+            mode, kind, oid = metadata.split()
+            if mode not in {b"100644", b"100755"} or kind != b"blob":
+                raise HostedAuditError("repository-history-mode-unsupported")
+            if (oid, raw_path) in seen:
+                continue
+            seen.add((oid, raw_path))
+            source = f"history-blob:{oid.decode()}:{hashlib.sha256(raw_path).hexdigest()}"
+            findings.extend(scan_bytes(raw_path, source=source + ":path"))
+            if oid not in blobs:
+                size = int(_git(directory, ["cat-file", "-s", oid.decode()]))
+                budget.admit(size)
+                blobs[oid] = _git(directory, ["cat-file", "blob", oid.decode()])
+            path = raw_path.decode("utf-8")
             findings.extend(
                 scan_bytes(
-                    data,
-                    source=entry_source,
-                    suffix=Path(info.filename).suffix,
+                    blobs[oid],
+                    source=source,
+                    suffix=Path(path).suffix,
+                    include_restricted=path != "scripts/public_boundary_policy.py",
                 )
             )
-            entries.append(
-                {
-                    "pathDigest": hashlib.sha256(info.filename.encode("utf-8")).hexdigest(),
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "bytes": len(data),
-                }
+    return findings, {
+        "authority": "authenticated-complete-git-mirror",
+        "commits": len(commits),
+        "blobs": len(blobs),
+        "annotatedTags": len(tag_objects),
+        "refsDigest": hashlib.sha256(refs).hexdigest(),
+    }
+
+
+def _collect_git_history(repository: str, roots: list[str]) -> tuple[list[Finding], dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="hosted-history-") as temporary:
+        directory = Path(temporary) / "mirror.git"
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "credential.helper=",
+                    "-c",
+                    "credential.helper=!gh auth git-credential",
+                    "clone",
+                    "--mirror",
+                    "--quiet",
+                    f"https://github.com/{repository}.git",
+                    str(directory),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=120,
             )
-    return findings, {"sha256": hashlib.sha256(payload).hexdigest(), "entries": entries}
+            for sha in sorted(set(roots)):
+                if not SHA_PATTERN.fullmatch(sha):
+                    raise HostedAuditError("repository-history-root-invalid")
+                _git(
+                    directory,
+                    [
+                        "-c",
+                        "credential.helper=",
+                        "-c",
+                        "credential.helper=!gh auth git-credential",
+                        "fetch",
+                        "--quiet",
+                        "origin",
+                        f"{sha}:refs/audit/{sha}",
+                    ],
+                )
+            return _scan_git_repository(directory)
+        except (OSError, subprocess.SubprocessError, ContentAuditError) as error:
+            raise HostedAuditError("repository-history-unavailable") from error
+
+
+def _connection(
+    query: str, variables: dict[str, Any], path: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    while True:
+        arguments = ["api", "graphql", "-f", f"query={query}"]
+        for key, value in {**variables, **({"cursor": cursor} if cursor else {})}.items():
+            arguments.extend(["-F" if type(value) is int else "-f", f"{key}={value}"])
+        value = _json(arguments)
+        try:
+            if value.get("errors"):
+                raise HostedAuditError("graphql-inventory-incomplete")
+            for key in path:
+                value = value[key]
+            page = value["pageInfo"]
+            nodes = value["nodes"]
+            if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+                raise HostedAuditError("graphql-inventory-invalid")
+            if type(page["hasNextPage"]) is not bool:
+                raise HostedAuditError("graphql-pagination-invalid")
+            records.extend(nodes)
+            if len(records) > 10000:
+                raise HostedAuditError("graphql-inventory-budget")
+            if not page["hasNextPage"]:
+                return records
+            cursor = page["endCursor"]
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise HostedAuditError("graphql-pagination-invalid")
+            seen.add(cursor)
+        except (KeyError, TypeError, AttributeError) as error:
+            raise HostedAuditError("graphql-inventory-invalid") from error
+
+
+PAGE_INFO = "pageInfo{hasNextPage endCursor}"
 
 
 def _collect_discussions(
     owner: str, name: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     query = (
-        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
-        "discussions(first:100){pageInfo{hasNextPage}nodes{"
-        "id number title body url comments(first:100){"
-        "pageInfo{hasNextPage}nodes{id body url}}}}}}"
+        "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){"
+        "discussions(first:100,after:$cursor){" + PAGE_INFO + "nodes{id number title body url}}}}"
     )
-    value = _json(
-        [
-            "api",
-            "graphql",
-            "-f",
-            f"query={query}",
-            "-f",
-            f"owner={owner}",
-            "-f",
-            f"name={name}",
-        ]
+    discussions = _connection(
+        query, {"owner": owner, "name": name}, ("data", "repository", "discussions")
     )
-    try:
-        discussions = value["data"]["repository"]["discussions"]
-    except (KeyError, TypeError) as error:
-        raise HostedAuditError("discussion inventory returned the wrong shape") from error
-    if discussions["pageInfo"]["hasNextPage"]:
-        raise HostedAuditError("discussion inventory was truncated")
-    records: list[dict[str, Any]] = []
-    comments: list[dict[str, Any]] = []
-    for discussion in discussions["nodes"]:
-        discussion_comments = discussion.pop("comments")
-        if discussion_comments["pageInfo"]["hasNextPage"]:
-            raise HostedAuditError("discussion comment inventory was truncated")
-        comments.extend(discussion_comments["nodes"])
-        records.append(discussion)
-    return records, comments
+    comments = []
+    for discussion in discussions:
+        query = (
+            "query($id:ID!,$cursor:String){node(id:$id){...on Discussion{"
+            "comments(first:100,after:$cursor){" + PAGE_INFO + "nodes{id body url}}}}}"
+        )
+        children = _connection(query, {"id": discussion["id"]}, ("data", "node", "comments"))
+        for comment in children:
+            query = (
+                "query($id:ID!,$cursor:String){node(id:$id){...on DiscussionComment{"
+                "replies(first:100,after:$cursor){" + PAGE_INFO + "nodes{id body url}}}}}"
+            )
+            comment["replies"] = _connection(
+                query, {"id": comment["id"]}, ("data", "node", "replies")
+            )
+        comments.extend(children)
+    return discussions, comments
+
+
+def _collect_review_threads(owner: str, name: str, number: int) -> list[dict[str, Any]]:
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){"
+        "pullRequest(number:$number){reviewThreads(first:100,after:$cursor){"
+        + PAGE_INFO
+        + "nodes{id isResolved isOutdated path line originalLine}}}}}"
+    )
+    threads = _connection(
+        query,
+        {"owner": owner, "name": name, "number": number},
+        ("data", "repository", "pullRequest", "reviewThreads"),
+    )
+    for thread in threads:
+        query = (
+            "query($id:ID!,$cursor:String){node(id:$id){...on PullRequestReviewThread{"
+            "comments(first:100,after:$cursor){"
+            + PAGE_INFO
+            + "nodes{id body url path createdAt updatedAt}}}}}"
+        )
+        thread["comments"] = _connection(query, {"id": thread["id"]}, ("data", "node", "comments"))
+    return threads
+
+
+def _collect_workflow_run(
+    repository: str, run: dict[str, Any]
+) -> tuple[list[dict], list[dict], list[Finding]]:
+    run_id, attempts = run.get("id"), run.get("run_attempt")
+    if (
+        type(run_id) is not int
+        or type(attempts) is not int
+        or not 1 <= attempts <= 100
+        or run.get("status") != "completed"
+    ):
+        raise HostedAuditError("workflow-run-incomplete")
+    jobs, logs, findings = [], [], []
+    for attempt in range(1, attempts + 1):
+        prefix = f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}"
+        metadata = run if attempt == attempts else _object(prefix)
+        if metadata is None or metadata.get("status") != "completed":
+            raise HostedAuditError("workflow-attempt-incomplete")
+        attempt_jobs = _list(prefix + "/jobs?per_page=100", collection_key="jobs")
+        jobs.extend(attempt_jobs)
+        skipped = metadata.get("conclusion") == "skipped" and all(
+            job.get("status") == "completed"
+            and job.get("conclusion") == "skipped"
+            and isinstance(job.get("steps"), list)
+            and all(step.get("conclusion") == "skipped" for step in job["steps"])
+            for job in attempt_jobs
+        )
+        payload = _gh(["api", prefix + "/logs"], binary=True, allow_absent=skipped)
+        if not payload:
+            if not skipped:
+                raise HostedAuditError("workflow-logs-unavailable")
+            logs.append(
+                {
+                    "runId": run_id,
+                    "attempt": attempt,
+                    "state": "unavailable-skipped-jobs",
+                    "contentInspected": False,
+                    "jobs": len(attempt_jobs),
+                }
+            )
+            continue
+        current_findings, receipt = _scan_zip(
+            payload, source=f"workflow-log:{run_id}:{attempt}", repository=repository
+        )
+        findings.extend(current_findings)
+        logs.append(
+            {
+                "runId": run_id,
+                "attempt": attempt,
+                "state": "inspected",
+                "contentInspected": True,
+                **receipt,
+            }
+        )
+    return jobs, logs, findings
+
+
+def _subject_digests(receipt: dict[str, Any]) -> list[str]:
+    result = [receipt["sha256"]] if "sha256" in receipt else []
+    for child in receipt.get("entries", receipt.get("children", [])):
+        result.extend(_subject_digests(child))
+    return result
 
 
 def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Finding]]:
-    if repository.count("/") != 1:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise HostedAuditError("repository must use owner/name form")
     owner, name = repository.split("/", maxsplit=1)
     prefix = f"repos/{owner}/{name}"
@@ -280,6 +545,7 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
         if not isinstance(number, int):
             raise HostedAuditError("pull request inventory omitted its number")
         surfaces["pullReviews"].extend(_list(f"{prefix}/pulls/{number}/reviews?per_page=100"))
+        surfaces["pullReviewThreads"].extend(_collect_review_threads(owner, name, number))
         surfaces["pullCommits"].extend(_list(f"{prefix}/pulls/{number}/commits?per_page=100"))
 
     surfaces["workflows"] = _list(
@@ -289,17 +555,10 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
         f"{prefix}/actions/runs?per_page=100", collection_key="workflow_runs"
     )
     for run in surfaces["workflowRuns"]:
-        run_id = run.get("id")
-        if not isinstance(run_id, int):
-            raise HostedAuditError("workflow run inventory omitted its id")
-        jobs = _object(f"{prefix}/actions/runs/{run_id}/jobs?per_page=100")
-        if jobs is None or not isinstance(jobs.get("jobs"), list):
-            raise HostedAuditError("workflow job inventory returned the wrong shape")
-        surfaces["workflowJobs"].extend(jobs["jobs"])
-        log_payload = _gh(["api", f"{prefix}/actions/runs/{run_id}/logs"], binary=True)
-        log_findings, log_receipt = _scan_zip(log_payload, source=f"workflow-log:{run_id}")
+        jobs, logs, log_findings = _collect_workflow_run(repository, run)
+        surfaces["workflowJobs"].extend(jobs)
+        surfaces["workflowLogs"].extend(logs)
         findings.extend(log_findings)
-        surfaces["workflowLogs"].append({"runId": run_id, **log_receipt})
 
     surfaces["artifacts"] = _list(
         f"{prefix}/actions/artifacts?per_page=100", collection_key="artifacts"
@@ -308,9 +567,16 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
         artifact_id = artifact.get("id")
         if not isinstance(artifact_id, int):
             raise HostedAuditError("artifact inventory omitted its id")
+        if artifact.get("expired") is not False:
+            raise HostedAuditError("artifact-content-unavailable")
         payload = _gh(["api", f"{prefix}/actions/artifacts/{artifact_id}/zip"], binary=True)
         artifact_findings, receipt = _scan_zip(payload, source=f"artifact:{artifact_id}")
         findings.extend(artifact_findings)
+        if (
+            artifact.get("digest") is not None
+            and artifact["digest"] != "sha256:" + receipt["sha256"]
+        ):
+            raise HostedAuditError("artifact-digest-mismatch")
         artifact["contentReceipt"] = receipt
 
     surfaces["caches"] = _list(
@@ -318,9 +584,37 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
     )
     surfaces["releases"] = _list(f"{prefix}/releases?per_page=100")
     for release in surfaces["releases"]:
-        assets = release.get("assets", [])
-        if not isinstance(assets, list):
-            raise HostedAuditError("release assets returned the wrong shape")
+        release_id = release.get("id")
+        if type(release_id) is not int:
+            raise HostedAuditError("release inventory omitted its id")
+        assets = _list(f"{prefix}/releases/{release_id}/assets?per_page=100")
+        for asset in assets:
+            asset_id, asset_name = asset.get("id"), asset.get("name")
+            if type(asset_id) is not int or not isinstance(asset_name, str) or not asset_name:
+                raise HostedAuditError("release asset authority missing")
+            payload = _gh(
+                [
+                    "api",
+                    f"{prefix}/releases/assets/{asset_id}",
+                    "-H",
+                    "Accept: application/octet-stream",
+                ],
+                binary=True,
+            )
+            source = f"release-asset:{asset_id}"
+            if asset_name.lower().endswith((".zip", ".whl", ".tar", ".tar.gz", ".tgz")):
+                content_findings, receipt = scan_archive(payload, source=source, name=asset_name)
+            else:
+                content_findings = scan_bytes(
+                    payload, source=source, suffix=Path(asset_name).suffix
+                )
+                receipt = {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+            if asset.get("size") != len(payload) or (
+                asset.get("digest") is not None and asset["digest"] != "sha256:" + receipt["sha256"]
+            ):
+                raise HostedAuditError("release-asset-digest-mismatch")
+            asset["contentReceipt"] = receipt
+            findings.extend(content_findings)
         surfaces["releaseAssets"].extend(assets)
     surfaces["deployments"] = _list(f"{prefix}/deployments?per_page=100")
     for deployment in surfaces["deployments"]:
@@ -330,12 +624,9 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
         surfaces["deploymentStatuses"].extend(
             _list(f"{prefix}/deployments/{deployment_id}/statuses?per_page=100")
         )
-    environments = _object(f"{prefix}/environments?per_page=100", allow_absent=True)
-    if environments is not None:
-        rows = environments.get("environments")
-        if not isinstance(rows, list):
-            raise HostedAuditError("environment inventory returned the wrong shape")
-        surfaces["environments"] = rows
+    surfaces["environments"] = _list(
+        f"{prefix}/environments?per_page=100", collection_key="environments"
+    )
     pages = _object(f"{prefix}/pages", allow_absent=True)
     if pages is not None:
         surfaces["pages"] = [pages]
@@ -367,8 +658,24 @@ def collect_live_inventory(repository: str) -> tuple[dict[str, Any], list[Findin
                 if package_repository == repository:
                     surfaces["packages"].append(package)
 
-    if surfaces["artifacts"] or surfaces["releaseAssets"] or surfaces["packages"]:
-        raise HostedAuditError("attestation inventory is not derivable for hosted artifacts")
+    if surfaces["packages"]:
+        raise HostedAuditError("package-payload-audit-unsupported")
+
+    roots = [row["commit"]["sha"] for row in surfaces["branches"] + surfaces["tags"]]
+    for pull in surfaces["pullRequests"]:
+        roots.extend([pull["head"]["sha"], pull["base"]["sha"]])
+        if pull.get("merge_commit_sha"):
+            roots.append(pull["merge_commit_sha"])
+    history_findings, history_receipt = _collect_git_history(repository, roots)
+    findings.extend(history_findings)
+    surfaces["repositoryHistory"] = [history_receipt]
+    subjects = []
+    for artifact in surfaces["artifacts"] + surfaces["releaseAssets"]:
+        subjects.extend(_subject_digests(artifact["contentReceipt"]))
+    coverage = _collect_attestations(repository, repo["id"], subjects)
+    if not coverage["complete"]:
+        raise HostedAuditError("attested-subject-inventory-incomplete")
+    surfaces["attestationCoverage"] = [coverage]
     inventory = {"repository": repository, "surfaces": surfaces}
     return inventory, findings
 
@@ -472,12 +779,22 @@ def main() -> int:
             return 0
         collected_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         _write_receipt(args.digest_output, _live_receipt(inventory, collected_at=collected_at))
-    except (HostedAuditError, OSError, json.JSONDecodeError) as error:
+    except (
+        HostedAuditError,
+        ContentAuditError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as error:
         category = str(error)
         allowed = {
             "fixture-mode-forbidden",
             "unrecognized-hosted-surface",
             "hosted-surface-inventory-incomplete",
+            "attestation-enumeration-unavailable",
+            "attested-subject-inventory-incomplete",
         }
         if category not in allowed:
             category = "hosted-inventory-incomplete"

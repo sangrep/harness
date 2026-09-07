@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/sangrep/contracts",
+  "commit": "28f6d9ada5b2da9fb432aead11462104207750c0",
+  "sourcePath": "scripts/audit-public-hosted-metadata",
+  "sourceSha256": "db6c095a3ab01236d02e9e79fe437fa44e30db0b68a8f5ef013833e2e1a323ad",
+  "sourceLicense": "Apache-2.0",
+  "destination": "scripts/hosted_audit_content.py",
+  "adaptedFunction": "project_runner_paths",
+  "modifications": [
+    "Rename and format the runner-path helper for this component.",
+    "Retain narrow token/root boundaries and add refusal for parent traversal in the projected suffix.",
+    "Apply the projection only to authenticated workflow-log archive contents; preserve original-byte digests.",
+    "Normalize comma delimiters only in the observed timestamped setup-uv dependency-glob message."
+  ],
+  "licenseText": "LICENSES/Apache-2.0.txt",
+  "upstreamNotice": "provenance/hosted-audit-upstream-NOTICE.txt",
+  "reviewedReferenceTests": {
+    "path": "tests/test_hosted_audit_v1.py",
+    "sha256": "20d9851a599d0917ddc938bba22e5f5a483c27378e12f951788430f975c6bc26"
+  }
+}

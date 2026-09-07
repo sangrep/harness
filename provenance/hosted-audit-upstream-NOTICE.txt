@@ -1,0 +1,8 @@
+Sangrep Contracts
+Copyright 2026 Sangrep contributors
+
+This product includes software, schemas, documentation, and synthetic conformance vectors
+developed for Sangrep Contracts and licensed under the Apache License, Version 2.0.
+
+The development trust registry contains public verification material only. It grants no trademark
+license and establishes no production signing authority, product release, or support commitment.

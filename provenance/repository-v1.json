@@ -20,6 +20,11 @@
       "path": "LICENSES/AGPL-3.0-or-later.txt",
       "source": "https://www.gnu.org/licenses/agpl-3.0.txt",
       "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+    },
+    {
+      "path": "LICENSES/Apache-2.0.txt",
+      "source": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     }
   ],
   "embeddedThirdPartySource": [],
@@ -27,5 +32,6 @@
     "requirements-dev.txt": "requirements-dev.in",
     "requirements-runtime.txt": "requirements-runtime.in",
     "provenance/integration-map-v1.json": "scripts/provenance-map"
-  }
+  },
+  "verificationSourceReuse": "provenance/hosted-audit-reuse-v1.json"
 }

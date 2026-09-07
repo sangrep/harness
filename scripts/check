@@ -5,7 +5,9 @@ required=(
   README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md SUPPORT.md GOVERNANCE.md
   AGENTS.md LICENSE NOTICE .github/CODEOWNERS .github/PULL_REQUEST_TEMPLATE.md
   scripts/check scripts/check-gitleaks scripts/check-public-boundary scripts/audit-public-hosted-metadata
-  scripts/public_boundary_policy.py
+  scripts/public_boundary_policy.py pyproject.toml mkdocs.yml requirements-dev.txt
+  scripts/bootstrap scripts/bootstrap-contracts scripts/check-package scripts/check-docs
+  scripts/check-licenses ORIGIN.md provenance/contracts-v1.json provenance/repository-v1.json
 )
 
 for path in "${required[@]}"; do
@@ -23,6 +25,15 @@ fi
 python3 -c 'import ast, pathlib, sys; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8"), filename=path) for path in sys.argv[1:]]' \
   scripts/public_boundary_policy.py scripts/check-public-boundary \
   scripts/audit-public-hosted-metadata
+python3 scripts/bootstrap-contracts
+python3 -m ruff check src tests examples scripts/bootstrap-contracts scripts/check-docs scripts/check-package scripts/check-licenses scripts/provenance-map scripts/check-tests
+python3 -m ruff format --check src tests examples scripts/bootstrap-contracts scripts/check-docs scripts/check-package scripts/check-licenses scripts/provenance-map scripts/check-tests
+python3 -m mypy
+python3 scripts/check-tests
+python3 scripts/check-package
+python3 scripts/check-docs
+python3 scripts/check-licenses
+python3 scripts/provenance-map
 ./scripts/check-gitleaks
 PYTHONDONTWRITEBYTECODE=1 ./scripts/check-public-boundary
 printf 'repository-check: passed\n'

@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Reproduce or verify the accepted contracts wheel before installation."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import shutil
+import subprocess
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def verify_artifact(path: Path, digest: str, size: int | None = None) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("artifact-identity")
+    payload = path.read_bytes()
+    if (size is not None and len(payload) != size) or hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError("artifact-identity")
+
+
+def extract_source(archive: Path, destination: Path, prefix: str) -> Path:
+    with tarfile.open(archive, "r:gz") as stream:
+        members = stream.getmembers()
+        if len(members) > 512 or sum(member.size for member in members) > 16 * 1024 * 1024:
+            raise ValueError("archive-boundary")
+        seen: set[str] = set()
+        for member in members:
+            path = PurePosixPath(member.name)
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or not path.parts
+                or path.parts[0] != prefix
+                or not (member.isfile() or member.isdir())
+                or member.name in seen
+            ):
+                raise ValueError("archive-boundary")
+            seen.add(member.name)
+        # Every entry is checked before writing; no links or archive modes are applied.
+        for member in members:
+            target = destination / member.name
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = stream.extractfile(member)
+                if source is None:
+                    raise ValueError("archive-boundary")
+                with source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+    return destination / prefix
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wheel", type=Path, help="Verify a previously supplied wheel")
+    args = parser.parse_args()
+    lock = json.loads((ROOT / "provenance/contracts-v1.json").read_text())
+    destination = ROOT / "work/dependencies"
+    destination.mkdir(parents=True, exist_ok=True)
+    wheel = destination / lock["wheelName"]
+    try:
+        if args.wheel is not None:
+            verify_artifact(args.wheel, lock["wheelSha256"], lock["wheelBytes"])
+            if args.wheel.resolve() != wheel.resolve():
+                shutil.copyfile(args.wheel, wheel)
+        elif not wheel.exists():
+            if importlib.metadata.version("hatchling") != "1.32.0":
+                raise ValueError("build-backend")
+            archive = destination / "contracts-source.tar.gz"
+            subprocess.run(
+                [
+                    "curl",
+                    "--fail",
+                    "--location",
+                    "--silent",
+                    "--max-time",
+                    "120",
+                    lock["sourceUrl"],
+                    "--output",
+                    str(archive),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            verify_artifact(archive, lock["sourceSha256"])
+            unpacked = destination / "source"
+            if unpacked.exists():
+                shutil.rmtree(unpacked)
+            source = extract_source(archive, unpacked, f"contracts-{lock['sourceCommit']}")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "build",
+                    "--wheel",
+                    "--no-isolation",
+                    "--outdir",
+                    str(destination),
+                    str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        verify_artifact(wheel, lock["wheelSha256"], lock["wheelBytes"])
+    except (
+        OSError,
+        ValueError,
+        tarfile.TarError,
+        subprocess.CalledProcessError,
+        importlib.metadata.PackageNotFoundError,
+    ):
+        print("contracts-bootstrap: blocked artifact-verification", file=sys.stderr)
+        return 1
+    print(f"contracts-bootstrap: verified {lock['wheelName']} sha256={lock['wheelSha256']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

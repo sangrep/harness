@@ -16,6 +16,8 @@ GENERATED_OUTPUT_ROOTS = (
     "generated",
     "out",
     "reports",
+    "work/docs-site",
+    "work/package-content",
 )
 ALLOWED_BINARY_SUFFIXES = {
     ".gif",

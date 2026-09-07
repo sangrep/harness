@@ -1,0 +1,4 @@
+Synthetic field notes for the Harbor observatory.
+The duty observer inspected the dust filter on 3 March.
+The filter housing was reported cracked on 12 March.
+The gallery remained open during the instrument outage.

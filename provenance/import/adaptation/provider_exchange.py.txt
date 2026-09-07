@@ -1,0 +1,724 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import NoReturn, Protocol, overload, runtime_checkable
+from sangrep_harness.review import ProviderCallStateV1
+from sangrep_harness.ports import AuthoritativePreflightStateError, PreflightFailureCodeV1, PreflightStateV1, ReviewPreflightInputsV1, ReviewPreflightInputsV2, ReviewPreflightV1, ReviewPreflightV2, TypedPreflightFailureV1
+from sangrep_harness.ports import ReviewTaskRouteError, ReviewTaskRouteFailureCodeV1
+from sangrep_harness.wire import FrozenJsonObjectV1, canonical_json_sha256_v1, freeze_json_object_v1
+from sangrep_harness.ports import decode_agent_turn_response_v2
+from sangrep_harness.providers.base import ProviderCallError, ProviderFailureAuthorityV1, ProviderFailureCategoryV1, ProviderFailureDiagnosticV1, ProviderResponseFailureCodeV1
+from sangrep_harness.providers.egress import ProviderEgressRequestV1, SealedReviewRequestV1, SealedReviewRequestV2
+from sangrep_harness.ports import ProviderArtifactRefsV1, ProviderSendReservationV1
+
+
+class ProviderArtifactRepositoryV1(Protocol):
+    def append_preflight_manifest(
+        self,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+    ) -> None: ...
+
+    def get_exchange(
+        self,
+        preflight_id: str,
+        *,
+        include_payloads: bool = False,
+    ) -> ProviderArtifactRefsV1 | None: ...
+
+    def reserve_send(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+        authority_check: Callable[[], None] | None = None,
+    ) -> ProviderSendReservationV1: ...
+
+    def append_response_capture(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+        response_payload: bytes,
+    ) -> None: ...
+
+    def append_tool_capture(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        ordinal: int,
+        tool_payload: bytes,
+    ) -> None: ...
+
+    def finalize_captured_exchange(
+        self,
+        preflight: ReviewPreflightV1,
+    ) -> ProviderArtifactRefsV1 | None: ...
+
+    def append_exchange(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+        response_payload: bytes,
+        tool_payloads: tuple[bytes, ...],
+        replay_payloads: tuple[bytes, ...],
+    ) -> ProviderArtifactRefsV1: ...
+
+    def append_failed_exchange(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+        failure_category: ProviderFailureCategoryV1,
+        failure_diagnostic: ProviderFailureDiagnosticV1 | None = None,
+        private_failure_authority: ProviderFailureAuthorityV1 | None = None,
+    ) -> ProviderArtifactRefsV1: ...
+
+
+class ProviderArtifactRepositoryV2(Protocol):
+    def append_preflight_manifest(
+        self,
+        preflight: ReviewPreflightV2,
+        request_payload: bytes,
+    ) -> None: ...
+
+    def get_exchange(
+        self,
+        preflight_id: str,
+        *,
+        include_payloads: bool = False,
+    ) -> ProviderArtifactRefsV1 | None: ...
+
+    def reserve_responses_send(
+        self,
+        *,
+        preflight: ReviewPreflightV2,
+        sealed_request_payload: bytes,
+        physical_request: object,
+        authority_check: Callable[[], None] | None = None,
+    ) -> ProviderSendReservationV1: ...
+
+    def append_raw_response_authority(self, **kwargs: object) -> None: ...
+
+    def append_responses_capture(self, **kwargs: object) -> None: ...
+
+    def append_tool_capture(self, **kwargs: object) -> None: ...
+
+    def finalize_responses_exchange(
+        self,
+        preflight: ReviewPreflightV2,
+    ) -> ProviderArtifactRefsV1 | None: ...
+
+    def append_failed_responses_exchange(self, **kwargs: object) -> ProviderArtifactRefsV1: ...
+
+    def append_failed_exchange(
+        self,
+        *,
+        preflight: ReviewPreflightV1,
+        request_payload: bytes,
+        failure_category: ProviderFailureCategoryV1,
+        failure_diagnostic: ProviderFailureDiagnosticV1 | None = None,
+        private_failure_authority: ProviderFailureAuthorityV1 | None = None,
+    ) -> ProviderArtifactRefsV1: ...
+
+
+class ProviderReviewTransportV1(Protocol):
+    def complete(self, request: ProviderEgressRequestV1) -> ProviderTransportResponseV1: ...
+
+
+@runtime_checkable
+class ProviderArtifactCapturingTransportV1(Protocol):
+    def complete_with_artifact_capture(
+        self,
+        request: ProviderEgressRequestV1,
+        *,
+        capture_response: Callable[[bytes], None],
+        capture_tool: Callable[[int, bytes], None],
+    ) -> ProviderTransportResponseV1: ...
+
+
+@runtime_checkable
+class ProviderRoutedIdentityTransportV1(Protocol):
+    def validate_routed_request(self, request: ProviderEgressRequestV1) -> None: ...
+
+    def validate_routed_response(
+        self,
+        response_payload: bytes,
+        *,
+        route_decision_sha256: str,
+        route_policy_sha256: str,
+        pricing_authority_sha256: str,
+        provider_id: str,
+        model_id: str,
+    ) -> None: ...
+
+
+class AuthoritativeReviewResolverV1(Protocol):
+    def seal_preflight_inputs(
+        self,
+        inputs: ReviewPreflightInputsV1,
+    ) -> ReviewPreflightInputsV1: ...
+
+    def resolve_approved_request(
+        self,
+        preflight: ReviewPreflightV1,
+    ) -> SealedReviewRequestV1: ...
+
+
+class AuthoritativeReviewResolverV2(Protocol):
+    def seal_preflight_inputs(
+        self,
+        inputs: ReviewPreflightInputsV2,
+    ) -> ReviewPreflightInputsV2: ...
+
+    def resolve_approved_request(
+        self,
+        preflight: ReviewPreflightV2,
+    ) -> SealedReviewRequestV2: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ProviderTransportResponseV1:
+    response_payload: bytes = field(repr=False)
+    tool_payloads: tuple[bytes, ...] = field(default=(), repr=False)
+    replay_payloads: tuple[bytes, ...] = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.response_payload) is not bytes:
+            raise TypeError("Provider response must be exact bytes.")
+        if type(self.tool_payloads) is not tuple or any(
+            type(payload) is not bytes for payload in self.tool_payloads
+        ):
+            raise TypeError("Provider tool responses must be an immutable bytes tuple.")
+        if type(self.replay_payloads) is not tuple or any(
+            type(payload) is not bytes for payload in self.replay_payloads
+        ):
+            raise TypeError("Provider replay responses must be an immutable bytes tuple.")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ReceiptedProviderResponseV1:
+    preflight_id: str
+    response_payload: bytes = field(repr=False)
+    tool_payloads: tuple[bytes, ...] = field(repr=False)
+    replay_payloads: tuple[bytes, ...] = field(repr=False)
+    artifacts: ProviderArtifactRefsV1
+    provider_call_state: ProviderCallStateV1 = ProviderCallStateV1.COMPLETED
+
+    def __repr__(self) -> str:
+        return (
+            "ReceiptedProviderResponseV1("
+            f"preflight_id={self.preflight_id!r}, "
+            f"provider_call_state={self.provider_call_state.value!r}, "
+            f"receipt_digest={self.artifacts.receipt_digest!r}, payloads=<redacted>)"
+        )
+
+    @property
+    def sanitized_receipt_json(self) -> str:
+        return json.dumps(
+            {
+                "artifactReceiptDigest": self.artifacts.receipt_digest,
+                "outcome": self.artifacts.outcome,
+                "preflightId": self.preflight_id,
+                "providerCallState": self.provider_call_state.value,
+                "requestSha256": self.artifacts.request_sha256,
+                "responseSha256": self.artifacts.response_sha256,
+                "toolSha256": list(self.artifacts.tool_sha256),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+class ProviderGatewayBlocked(RuntimeError):
+    """Sanitized local failure with its already-persisted blocked receipt."""
+
+    def __init__(
+        self,
+        failure: TypedPreflightFailureV1,
+        *,
+        receipt: ReviewPreflightV1 | ReviewPreflightV2,
+    ) -> None:
+        self.failure = failure
+        self.receipt = receipt
+        super().__init__(failure.message)
+
+
+class ProviderSendOutcomeUnknown(RuntimeError):
+    """A durable request reservation exists, so retry cannot safely resend."""
+
+
+class ProviderExchangeFailed(ProviderCallError):
+    """A provider failure whose sanitized terminal exchange is durable."""
+
+    def __init__(self, artifacts: ProviderArtifactRefsV1) -> None:
+        if type(artifacts) is not ProviderArtifactRefsV1 or artifacts.outcome != "provider_failed":
+            raise ValueError("Provider failure requires a provider_failed exchange receipt.")
+        self.artifacts = artifacts.redacted()
+        assert self.artifacts.provider_failure_category is not None
+        super().__init__(
+            "Provider request failed after send; the failure receipt was saved.",
+            user_message=(
+                "The provider request failed. Sangrep saved a failure receipt and will not "
+                "resend it."
+            ),
+            failure_category=self.artifacts.provider_failure_category,
+            failure_diagnostic=self.artifacts.provider_failure_diagnostic,
+        )
+
+
+class ProviderGateway:
+    __slots__ = (
+        "_artifact_repository",
+        "_authority_resolver",
+        "_cache",
+        "_capability",
+        "_clock",
+        "_preflight_repository",
+        "_pricing_authority",
+        "_pricing_authority_sha256",
+        "_route_decision_sha256",
+        "_route_model_id",
+        "_route_protocol_id",
+        "_route_policy_sha256",
+        "_route_provider_id",
+        "_route_reasoning_effort",
+        "_transport",
+    )
+
+    @overload
+    def complete(self, preflight: ReviewPreflightV1) -> ReceiptedProviderResponseV1: ...
+
+    @overload
+    def complete(self, preflight: ReviewPreflightV2) -> ReceiptedProviderResponseV1: ...
+
+    def complete(
+        self,
+        preflight: ReviewPreflightV1 | ReviewPreflightV2,
+    ) -> ReceiptedProviderResponseV1:
+        if isinstance(preflight, ReviewPreflightV2):
+            return self._complete_v2(preflight)
+        if type(preflight) is not ReviewPreflightV1:
+            raise TypeError("preflight must be ReviewPreflightV1.")
+        self._require_route_identity(preflight)
+        if preflight.state is not PreflightStateV1.APPROVED:
+            if preflight.failure is None:
+                raise RuntimeError("Blocked preflight has no typed failure.")
+            raise ProviderGatewayBlocked(preflight.failure, receipt=preflight)
+        existing = self._artifact_repository.get_exchange(
+            preflight.preflight_id,
+            include_payloads=True,
+        )
+        if existing is not None:
+            return self._response_from_exchange(preflight, existing)
+        captured = self._artifact_repository.finalize_captured_exchange(preflight)
+        if captured is not None:
+            return self._response_from_exchange(preflight, captured)
+        try:
+            sealed = self._authority_resolver.resolve_approved_request(preflight)
+        except AuthoritativePreflightStateError as error:
+            failure = TypedPreflightFailureV1.create(error.code)
+            receipt = self._persist_authoritative_blocked(
+                approved=preflight,
+                failure=failure,
+                observed_identity=error.observed_identity,
+            )
+            raise ProviderGatewayBlocked(failure, receipt=receipt) from None
+        sealed_failure = self._validate_sealed(preflight, sealed)
+        if sealed_failure is not None:
+            receipt = self._persist_authoritative_blocked(
+                approved=preflight,
+                failure=sealed_failure,
+                observed_identity=freeze_observed_seal(sealed),
+            )
+            raise ProviderGatewayBlocked(sealed_failure, receipt=receipt)
+        egress = self._prepare_egress(
+            preflight,
+            sealed_request=sealed,
+            authority=preflight.review_authority,
+        )
+        self._require_route_identity(egress)
+        if self._route_decision_sha256 is not None:
+            assert isinstance(self._transport, ProviderRoutedIdentityTransportV1)
+            self._transport.validate_routed_request(egress)
+
+        def revalidate() -> None:
+            latest = self._authority_resolver.resolve_approved_request(preflight)
+            if latest.seal_sha256 != sealed.seal_sha256:
+                raise AuthoritativePreflightStateError(
+                    PreflightFailureCodeV1.STALE_EVIDENCE,
+                    observed_identity=freeze_observed_seal(latest),
+                )
+            self._require_current_pricing()
+
+        try:
+            reservation = self._artifact_repository.reserve_send(
+                preflight=preflight,
+                request_payload=sealed.request_payload,
+                authority_check=revalidate,
+            )
+        except AuthoritativePreflightStateError as error:
+            failure = TypedPreflightFailureV1.create(error.code)
+            receipt = self._persist_authoritative_blocked(
+                approved=preflight,
+                failure=failure,
+                observed_identity=error.observed_identity,
+            )
+            raise ProviderGatewayBlocked(failure, receipt=receipt) from None
+        if not reservation.acquired:
+            existing = self._artifact_repository.get_exchange(
+                preflight.preflight_id,
+                include_payloads=True,
+            )
+            if existing is not None:
+                return self._response_from_exchange(preflight, existing)
+            raise ProviderSendOutcomeUnknown(
+                "Provider request was already reserved; outcome must be reconciled before retry."
+            )
+        response: object | None = None
+        failure_artifacts: ProviderArtifactRefsV1 | None = None
+        try:
+            if isinstance(self._transport, ProviderArtifactCapturingTransportV1):
+                response = self._transport.complete_with_artifact_capture(
+                    egress,
+                    capture_response=lambda payload: (
+                        self._artifact_repository.append_response_capture(
+                            preflight=preflight,
+                            request_payload=sealed.request_payload,
+                            response_payload=payload,
+                        )
+                    ),
+                    capture_tool=lambda ordinal, payload: (
+                        self._artifact_repository.append_tool_capture(
+                            preflight=preflight,
+                            ordinal=ordinal,
+                            tool_payload=payload,
+                        )
+                    ),
+                )
+            else:
+                response = self._transport.complete(egress)
+        except ReviewTaskRouteError:
+            captured_failure = self._artifact_repository.finalize_captured_exchange(preflight)
+            if captured_failure is not None:
+                self._require_exchange_route_identity(captured_failure)
+                self._validate_routed_response_payload(
+                    preflight,
+                    captured_failure.response_payload,
+                )
+            raise
+        except ProviderCallError as error:
+            failure_artifacts = self._artifact_repository.append_failed_exchange(
+                preflight=preflight,
+                request_payload=sealed.request_payload,
+                failure_category=error.failure_category,
+                failure_diagnostic=error.failure_diagnostic,
+                private_failure_authority=error.private_failure_authority,
+            )
+        if failure_artifacts is not None:
+            # Raise after leaving the provider exception handler so private adapter prose is not
+            # retained as the public failure's exception context.
+            self._require_exchange_route_identity(failure_artifacts)
+            raise ProviderExchangeFailed(failure_artifacts)
+        if type(response) is not ProviderTransportResponseV1:
+            raise TypeError("Provider transport returned an invalid response.")
+        artifacts = self._artifact_repository.append_exchange(
+            preflight=preflight,
+            request_payload=sealed.request_payload,
+            response_payload=response.response_payload,
+            tool_payloads=response.tool_payloads,
+            replay_payloads=response.replay_payloads,
+        )
+        self._require_exchange_route_identity(artifacts)
+        self._validate_routed_response_payload(preflight, response.response_payload)
+        return ReceiptedProviderResponseV1(
+            preflight_id=preflight.preflight_id,
+            response_payload=response.response_payload,
+            tool_payloads=response.tool_payloads,
+            replay_payloads=response.replay_payloads,
+            artifacts=artifacts,
+        )
+
+    def _complete_v2(
+        self,
+        preflight: ReviewPreflightV2,
+    ) -> ReceiptedProviderResponseV1:
+        self._require_route_identity(preflight)
+        if preflight.state is not PreflightStateV1.APPROVED:
+            if preflight.failure is None:
+                raise RuntimeError("Blocked preflight has no typed failure.")
+            raise ProviderGatewayBlocked(preflight.failure, receipt=preflight)
+        existing = self._artifact_repository.get_exchange(
+            preflight.preflight_id,
+            include_payloads=True,
+        )
+        if existing is not None:
+            return self._response_from_exchange_v2(preflight, existing)
+        captured = self._artifact_repository.finalize_responses_exchange(preflight)
+        if captured is not None:
+            reopened = self._artifact_repository.get_exchange(
+                preflight.preflight_id,
+                include_payloads=True,
+            )
+            if reopened is None:
+                raise RuntimeError("Finalized Responses exchange cannot be reopened.")
+            return self._response_from_exchange_v2(preflight, reopened)
+        try:
+            sealed = self._authority_resolver.resolve_approved_request(preflight)
+        except AuthoritativePreflightStateError as error:
+            failure = TypedPreflightFailureV1.create(error.code)
+            receipt = self._persist_authoritative_blocked_v2(
+                approved=preflight,
+                failure=failure,
+                observed_identity=error.observed_identity,
+            )
+            raise ProviderGatewayBlocked(failure, receipt=receipt) from None
+        if not isinstance(sealed, SealedReviewRequestV2):
+            _protocol_substitution("Authoritative resolver changed the sealed contract version.")
+        sealed_failure = self._validate_sealed_v2(preflight, sealed)
+        if sealed_failure is not None:
+            receipt = self._persist_authoritative_blocked_v2(
+                approved=preflight,
+                failure=sealed_failure,
+                observed_identity=freeze_observed_seal_v2(sealed),
+            )
+            raise ProviderGatewayBlocked(sealed_failure, receipt=receipt)
+        egress = self._prepare_egress_v2(
+            preflight,
+            sealed_request=sealed,
+            authority=preflight.review_authority,
+        )
+        self._require_route_identity(egress)
+        prepare = getattr(self._transport, "prepare_physical_request", None)
+        complete_prepared = getattr(
+            self._transport,
+            "complete_prepared_with_artifact_capture",
+            None,
+        )
+        if not callable(prepare) or not callable(complete_prepared):
+            raise TypeError("Responses gateway transport is incomplete.")
+        physical = prepare(egress)
+
+        def revalidate() -> None:
+            latest = self._authority_resolver.resolve_approved_request(preflight)
+            if not isinstance(latest, SealedReviewRequestV2) or latest.seal_sha256 != (
+                sealed.seal_sha256
+            ):
+                raise AuthoritativePreflightStateError(
+                    PreflightFailureCodeV1.STALE_EVIDENCE,
+                    observed_identity=(
+                        freeze_observed_seal_v2(latest)
+                        if isinstance(latest, SealedReviewRequestV2)
+                        else freeze_json_object_v1(
+                            {
+                                "code": "provider_protocol_substitution",
+                                "observedSha256": "0" * 64,
+                            }
+                        )
+                    ),
+                )
+            self._require_route_identity(preflight)
+            self._require_current_pricing()
+
+        try:
+            reservation = self._artifact_repository.reserve_responses_send(
+                preflight=preflight,
+                sealed_request_payload=sealed.request_payload,
+                physical_request=physical,
+                authority_check=revalidate,
+            )
+        except AuthoritativePreflightStateError as error:
+            failure = TypedPreflightFailureV1.create(error.code)
+            receipt = self._persist_authoritative_blocked_v2(
+                approved=preflight,
+                failure=failure,
+                observed_identity=error.observed_identity,
+            )
+            raise ProviderGatewayBlocked(failure, receipt=receipt) from None
+        if not reservation.acquired:
+            existing = self._artifact_repository.get_exchange(
+                preflight.preflight_id,
+                include_payloads=True,
+            )
+            if existing is not None:
+                return self._response_from_exchange_v2(preflight, existing)
+            raise ProviderSendOutcomeUnknown(
+                "Provider request was already reserved; outcome must be reconciled before retry."
+            )
+        raw_response_sha256: str | None = None
+        continuation_sha256: str | None = None
+
+        def capture_raw(authority: object) -> None:
+            nonlocal raw_response_sha256
+            raw_response_sha256 = str(getattr(authority, "canonical_sha256", ""))
+            self._artifact_repository.append_raw_response_authority(
+                preflight=preflight,
+                physical_request=physical,
+                authority=authority,
+            )
+
+        def capture_response(payload: bytes) -> None:
+            nonlocal continuation_sha256
+            response = decode_agent_turn_response_v2(payload)
+            continuation = response.private_provider_continuation
+            if continuation is None or raw_response_sha256 is None:
+                raise RuntimeError("Responses normalized capture lacks raw authority.")
+            continuation_sha256 = continuation.canonical_sha256
+            self._artifact_repository.append_responses_capture(
+                preflight=preflight,
+                response_payload=payload,
+                raw_response_sha256=raw_response_sha256,
+                continuation_sha256=continuation_sha256,
+            )
+
+        failure_artifacts: ProviderArtifactRefsV1 | None = None
+        response: object | None = None
+        try:
+            response = complete_prepared(
+                egress,
+                physical,
+                capture_raw_response=capture_raw,
+                capture_response=capture_response,
+                capture_tool=lambda ordinal, payload: self._artifact_repository.append_tool_capture(
+                    preflight=preflight,
+                    ordinal=ordinal,
+                    tool_payload=payload,
+                ),
+            )
+        except ProviderCallError as error:
+            raw_failure_code = getattr(error, "response_failure_code", None)
+            response_failure_code = (
+                raw_failure_code
+                if isinstance(raw_failure_code, ProviderResponseFailureCodeV1)
+                else None
+            )
+            failure_artifacts = self._artifact_repository.append_failed_responses_exchange(
+                preflight=preflight,
+                failure_category=error.failure_category,
+                failure_diagnostic=error.failure_diagnostic,
+                private_failure_authority=error.private_failure_authority,
+                provider_response_failure_code=response_failure_code,
+                raw_response_sha256=raw_response_sha256,
+                continuation_sha256=continuation_sha256,
+            )
+        if failure_artifacts is not None:
+            raise ProviderExchangeFailed(failure_artifacts)
+        if type(response) is not ProviderTransportResponseV1:
+            raise TypeError("Provider transport returned an invalid response.")
+        artifacts = self._artifact_repository.finalize_responses_exchange(preflight)
+        if artifacts is None:
+            failure = self._artifact_repository.append_failed_responses_exchange(
+                preflight=preflight,
+                failure_category=ProviderFailureCategoryV1.INVALID_RESPONSE,
+                provider_response_failure_code=(
+                    ProviderResponseFailureCodeV1.PROVIDER_CONTINUATION_INVALID
+                ),
+                raw_response_sha256=raw_response_sha256,
+                continuation_sha256=continuation_sha256,
+            )
+            raise ProviderExchangeFailed(failure)
+        reopened = self._artifact_repository.get_exchange(
+            preflight.preflight_id,
+            include_payloads=True,
+        )
+        if reopened is None:
+            raise RuntimeError("Completed Responses exchange cannot be reopened.")
+        return self._response_from_exchange_v2(preflight, reopened)
+
+    def _response_from_exchange(
+        self,
+        preflight: ReviewPreflightV1,
+        artifacts: ProviderArtifactRefsV1,
+    ) -> ReceiptedProviderResponseV1:
+        self._require_exchange_route_identity(artifacts)
+        if artifacts.outcome == "provider_failed":
+            raise ProviderExchangeFailed(artifacts)
+        if artifacts.outcome != "completed":
+            raise RuntimeError("Provider exchange has an unsupported terminal outcome.")
+        if artifacts.response_payload is None:
+            raise RuntimeError("Completed provider exchange is missing its response bytes.")
+        self._validate_routed_response_payload(preflight, artifacts.response_payload)
+        return ReceiptedProviderResponseV1(
+            preflight_id=preflight.preflight_id,
+            response_payload=artifacts.response_payload,
+            tool_payloads=artifacts.tool_payloads or (),
+            replay_payloads=artifacts.replay_payloads or (),
+            artifacts=artifacts.redacted(),
+        )
+
+    def _response_from_exchange_v2(
+        self,
+        preflight: ReviewPreflightV2,
+        artifacts: ProviderArtifactRefsV1,
+    ) -> ReceiptedProviderResponseV1:
+        self._require_exchange_route_identity(artifacts)
+        if (
+            artifacts.provider_protocol_id is not preflight.provider_protocol_id
+            or artifacts.reasoning_effort is not preflight.reasoning_effort
+        ):
+            _protocol_substitution("Responses exchange differs from its immutable route.")
+        if artifacts.outcome == "provider_failed":
+            raise ProviderExchangeFailed(artifacts)
+        if artifacts.outcome != "completed" or artifacts.response_payload is None:
+            raise RuntimeError("Completed Responses exchange is missing normalized bytes.")
+        decoded = decode_agent_turn_response_v2(artifacts.response_payload)
+        continuation = decoded.private_provider_continuation
+        if (
+            continuation is None
+            or continuation.canonical_sha256 != artifacts.continuation_sha256
+            or decoded.private_provider_raw_response_sha256 != artifacts.raw_response_sha256
+        ):
+            _protocol_substitution("Responses exchange continuation authority is invalid.")
+        return ReceiptedProviderResponseV1(
+            preflight_id=preflight.preflight_id,
+            response_payload=artifacts.response_payload,
+            tool_payloads=artifacts.tool_payloads or (),
+            replay_payloads=(),
+            artifacts=artifacts.redacted(),
+        )
+
+
+def freeze_observed_seal(sealed: SealedReviewRequestV1) -> FrozenJsonObjectV1:
+    return freeze_json_object_v1(
+        {
+            "admittedMediaSha256": canonical_json_sha256_v1(
+                [
+                    {
+                        "mediaId": item.media_id,
+                        "mimeType": item.mime_type,
+                        "payloadSha256": item.payload_sha256,
+                    }
+                    for item in sealed.admitted_media
+                ]
+            ),
+            "projectionSha256": sealed.projection_sha256,
+            "requestPayloadSha256": sealed.request_sha256,
+            "resolvedContextSha256": sealed.resolved_context_sha256,
+            "sealedRequestSha256": sealed.seal_sha256,
+        }
+    )
+
+
+def freeze_observed_seal_v2(sealed: SealedReviewRequestV2) -> FrozenJsonObjectV1:
+    return freeze_json_object_v1(
+        {
+            "admittedMaxOutputTokens": sealed.admitted_max_output_tokens,
+            "modelMaxOutputTokens": sealed.model_max_output_tokens,
+            "projectionSha256": sealed.projection_sha256,
+            "providerProtocolId": sealed.provider_protocol_id.value,
+            "reasoningEffort": sealed.reasoning_effort.value,
+            "requestPayloadSha256": sealed.request_sha256,
+            "resolvedContextSha256": sealed.resolved_context_sha256,
+            "sealedRequestSha256": sealed.seal_sha256,
+        }
+    )
+
+
+def _protocol_substitution(message: str) -> NoReturn:
+    raise ReviewTaskRouteError(
+        ReviewTaskRouteFailureCodeV1.PROVIDER_PROTOCOL_SUBSTITUTION,
+        message,
+    )

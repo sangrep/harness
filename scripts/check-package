@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Build and inspect the standalone wheel; smoke it without source-tree imports."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from email.parser import BytesParser
+from pathlib import Path, PurePosixPath
+
+from public_boundary_policy import scan_bytes
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main() -> int:
+    try:
+        with tempfile.TemporaryDirectory(prefix="harness-package-") as temporary:
+            output = Path(temporary)
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "build",
+                    "--wheel",
+                    "--no-isolation",
+                    "--outdir",
+                    str(output),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+            )
+            wheels = tuple(output.glob("*.whl"))
+            if len(wheels) != 1:
+                raise ValueError("artifact-count")
+            wheel = wheels[0]
+            if wheel.name != "sangrep_harness-0.1.0.dev0-py3-none-any.whl":
+                raise ValueError("artifact-identity")
+            with zipfile.ZipFile(wheel) as archive:
+                names: set[str] = set()
+                for item in archive.infolist():
+                    path = PurePosixPath(item.filename)
+                    if (
+                        path.is_absolute()
+                        or ".." in path.parts
+                        or item.filename in names
+                        or stat.S_ISLNK(item.external_attr >> 16)
+                        or not (
+                            item.filename.startswith("sangrep_harness/")
+                            or item.filename.startswith("sangrep_harness-0.1.0.dev0.dist-info/")
+                        )
+                    ):
+                        raise ValueError("artifact-path")
+                    names.add(item.filename)
+                    if scan_bytes(
+                        archive.read(item), source=f"wheel:{item.filename}", suffix=path.suffix
+                    ):
+                        raise ValueError("artifact-boundary")
+                for license_path in ("LICENSE", "NOTICE", "LICENSES/AGPL-3.0-or-later.txt"):
+                    member = f"sangrep_harness-0.1.0.dev0.dist-info/licenses/{license_path}"
+                    if archive.read(member) != (ROOT / license_path).read_bytes():
+                        raise ValueError("artifact-license-text")
+                metadata_name = "sangrep_harness-0.1.0.dev0.dist-info/METADATA"
+                metadata = BytesParser().parsebytes(archive.read(metadata_name))
+                if (
+                    metadata["Name"] != "sangrep-harness"
+                    or metadata["Version"] != "0.1.0.dev0"
+                    or set(metadata.get_all("Requires-Dist") or [])
+                    != {"sangrep-contracts==0.1.0.dev0", "pydantic==2.12.5"}
+                    or metadata["Requires-Python"] != ">=3.11"
+                    or metadata["License-Expression"]
+                    != "AGPL-3.0-or-later OR LicenseRef-Sangrep-Commercial"
+                    or "sangrep_harness/py.typed" not in names
+                ):
+                    raise ValueError("artifact-metadata")
+            contents = ROOT / "work/package-content"
+            if contents.exists():
+                shutil.rmtree(contents)
+            with zipfile.ZipFile(wheel) as archive:
+                for item in archive.infolist():
+                    target = contents / item.filename
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archive.read(item))
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "PYTHONHOME"}
+            }
+            environment["UV_NO_PROGRESS"] = "1"
+            subprocess.run(
+                ["uv", "venv", "--python", sys.executable, str(output / "venv"), "--quiet"],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            python = output / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python),
+                    "--require-hashes",
+                    "--quiet",
+                    "-r",
+                    str(ROOT / "requirements-runtime.txt"),
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            contracts = ROOT / "work/dependencies/sangrep_contracts-0.1.0.dev0-py3-none-any.whl"
+            subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python),
+                    "--no-deps",
+                    "--quiet",
+                    str(contracts),
+                    str(wheel),
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            probe = (
+                "import sys; from sangrep_harness.cli import main; "
+                "sys.argv = ['sangrep-harness', '--help']; raise SystemExit(main())"
+            )
+            subprocess.run(
+                [str(python), "-I", "-c", probe],
+                cwd=output,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+            cli = python.parent / ("sangrep-harness.exe" if os.name == "nt" else "sangrep-harness")
+            evidence = ROOT / "corpus/operations.md"
+            source_digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+            completed = subprocess.run(
+                [str(cli), "review", str(evidence), "--question", "Quote the rules."],
+                cwd=output,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+            review = json.loads(completed.stdout)
+            if review["outcome"] != "supported_answer" or not review["citations"]:
+                raise ValueError("cli-review")
+            if hashlib.sha256(evidence.read_bytes()).hexdigest() != source_digest:
+                raise ValueError("source-mutation")
+            for example in sorted((ROOT / "examples").glob("*.py")):
+                subprocess.run(
+                    [str(python), "-I", str(example)],
+                    cwd=output,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                )
+            payload = wheel.read_bytes()
+            artifacts = ROOT / "work/artifacts"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / wheel.name).write_bytes(payload)
+            receipt = {
+                "name": wheel.name,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+                "registryReleaseClaimed": False,
+            }
+            (artifacts / "wheel.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, subprocess.CalledProcessError):
+        print("package-check: blocked", file=sys.stderr)
+        return 1
+    print(f"package-check: passed sha256={receipt['sha256']} bytes={receipt['bytes']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

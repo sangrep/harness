@@ -1,0 +1,892 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from typing import NoReturn, Protocol, cast
+from sangrep_harness.review import CitationAdmissionV1, CoverageStateV1, EvidenceRootRefV1, ProviderCallStateV1, StructuralGrantV1
+from sangrep_harness.ports import ReviewPreflightV1
+from sangrep_harness.events import ReviewRunLedger, ReviewRunNotTerminal, RunLeaseV1
+from sangrep_harness.terminal import TerminalReviewDraftV1
+from sangrep_harness.ports import ReviewTaskRouteDecisionV1
+from sangrep_harness.task_runtime import ReviewTaskRuntime, ReviewTaskSpecV1, ReviewTaskTerminalDraftV1, ReviewTaskTerminalV1, RootContainmentV1
+from sangrep_harness.wire import JsonValue, ReviewEventTypeV1, ReviewStartV1, TerminalOutcomeV1, canonical_json_sha256_v1
+from sangrep_harness.diagnostics import ProviderFailureDiagnosticV1
+
+
+_RECONCILED_AUTHORITY = object()
+
+
+_PARENT_BRIDGE_AUTHORITY = object()
+
+
+class ReviewTaskReconciliationCodeV1(StrEnum):
+    """Closed fail-closed classes for parent reconciliation."""
+
+    INVALID_ARGUMENT = "invalid_argument"
+    TERMINAL_SET_MISMATCH = "terminal_set_mismatch"
+    DUPLICATE_TERMINAL = "duplicate_terminal"
+    AUTHORITY_MISMATCH = "authority_mismatch"
+    OUT_OF_GRANT_CITATION = "out_of_grant_citation"
+
+
+class ReviewTaskReconciliationError(RuntimeError):
+    """One child set cannot be safely represented as a parent result."""
+
+    def __init__(self, code: ReviewTaskReconciliationCodeV1, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ReviewTaskStoreV1(Protocol):
+    """Durable task operations required by the bounded orchestrator."""
+
+    def admit(
+        self,
+        *,
+        parent_run_id: str,
+        parent_grant: StructuralGrantV1,
+        tasks: Sequence[ReviewTaskSpecV1],
+        max_concurrency: int,
+        root_contains: RootContainmentV1,
+        created_by: str,
+    ) -> tuple[ReviewTaskSpecV1, ...]: ...
+
+    def list_tasks(
+        self,
+        parent_run_id: str,
+        *,
+        parent_grant: StructuralGrantV1,
+    ) -> tuple[ReviewTaskSpecV1, ...]: ...
+
+    def list_nonterminal(
+        self,
+        parent_run_id: str,
+        *,
+        parent_grant: StructuralGrantV1,
+    ) -> tuple[ReviewTaskSpecV1, ...]: ...
+
+    def list_terminals(
+        self,
+        parent_run_id: str,
+        *,
+        parent_grant: StructuralGrantV1,
+    ) -> tuple[ReviewTaskTerminalV1, ...]: ...
+
+    def child_run_id(self, task: ReviewTaskSpecV1) -> str | None: ...
+
+    def bind_terminal(
+        self,
+        task: ReviewTaskSpecV1,
+        *,
+        child_run_id: str,
+        failure_code: str | None,
+    ) -> ReviewTaskTerminalV1: ...
+
+
+class DurableReviewTaskTerminalizer:
+    """Prepare, terminalize, and bind a child through durable run authority only."""
+
+    __slots__ = (
+        "_created_by",
+        "_ledger",
+        "_preflight_for_task",
+        "_route_decision_for_task",
+        "_review_start_for_task",
+        "_tasks",
+    )
+
+    def __init__(
+        self,
+        ledger: ReviewRunLedger,
+        tasks: ReviewTaskStoreV1,
+        *,
+        preflight_for_task: Callable[[ReviewTaskSpecV1], ReviewPreflightV1],
+        review_start_for_task: Callable[[ReviewTaskSpecV1, ReviewPreflightV1], ReviewStartV1],
+        created_by: str,
+        route_decision_for_task: Callable[[ReviewTaskSpecV1], ReviewTaskRouteDecisionV1]
+        | None = None,
+    ) -> None:
+        if type(ledger) is not ReviewRunLedger:
+            raise TypeError("ledger must use ReviewRunLedger")
+        for name, value in (
+            ("preflight_for_task", preflight_for_task),
+            ("review_start_for_task", review_start_for_task),
+        ):
+            if not callable(value):
+                raise TypeError(f"{name} must be callable")
+        if type(created_by) is not str or not created_by.strip():
+            raise ValueError("created_by must be non-empty")
+        for method in ("child_run_id", "bind_terminal"):
+            if not callable(getattr(tasks, method, None)):
+                raise TypeError("review task store is incomplete")
+        self._ledger = ledger
+        self._tasks = tasks
+        self._preflight_for_task = preflight_for_task
+        self._review_start_for_task = review_start_for_task
+        self._route_decision_for_task = route_decision_for_task
+        self._created_by = created_by
+
+    def prepare(self, task: ReviewTaskSpecV1) -> RunLeaseV1:
+        """Ensure a child run-start event exists before worker side effects are allowed."""
+
+        child_run_id = self._tasks.child_run_id(task)
+        if child_run_id is not None:
+            return self._ledger.current_lease(child_run_id)
+        preflight = self._required_preflight(task)
+        start = self._review_start_for_task(task, preflight)
+        if type(start) is not ReviewStartV1:
+            raise TypeError("review_start_for_task must return ReviewStartV1")
+        route_decision = (
+            None if self._route_decision_for_task is None else self._route_decision_for_task(task)
+        )
+        return self._ledger.start_child(
+            task,
+            start,
+            preflight=preflight,
+            created_by=self._created_by,
+            route_decision=route_decision,
+        )
+
+    def __call__(
+        self,
+        task: ReviewTaskSpecV1,
+        intent: ReviewTaskTerminalDraftV1,
+    ) -> ReviewTaskTerminalV1:
+        if type(task) is not ReviewTaskSpecV1 or type(intent) is not ReviewTaskTerminalDraftV1:
+            raise TypeError("durable task terminalization values are invalid")
+        lease = self.prepare(task)
+        try:
+            persisted = self._ledger.get_terminal(lease.run_id, grant=task.grant)
+        except ReviewRunNotTerminal:
+            preflight = self._required_preflight(task)
+            provider_state = self._ledger.provider_call_state(lease.run_id)
+            persisted = self._ledger.terminalize(
+                self._ledger.current_lease(lease.run_id),
+                replace(intent.review, provider_call_state=provider_state),
+                preflight=preflight,
+                grant=task.grant,
+                recovery_reason_code=intent.failure_code,
+            )
+        return self._tasks.bind_terminal(
+            task,
+            child_run_id=persisted.result.run_id,
+            failure_code=persisted.recovery_reason_code,
+        )
+
+    def _required_preflight(self, task: ReviewTaskSpecV1) -> ReviewPreflightV1:
+        preflight = self._preflight_for_task(task)
+        if type(preflight) is not ReviewPreflightV1:
+            raise TypeError("preflight_for_task must return ReviewPreflightV1")
+        if (
+            preflight.question != task.instruction
+            or preflight.grant_id != task.grant.grant_id
+            or preflight.grant_digest != task.grant.digest
+            or preflight.limits != task.limits
+        ):
+            raise ReviewTaskReconciliationError(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "child preflight does not match its task authority",
+            )
+        return preflight
+
+
+class ReviewTaskOrchestrator:
+    """Persist, execute/recover, and reconcile one complete child-task batch."""
+
+    __slots__ = ("_prepare_task", "_tasks", "_terminalize")
+
+    def __init__(
+        self,
+        tasks: ReviewTaskStoreV1,
+        *,
+        prepare_task: Callable[[ReviewTaskSpecV1], RunLeaseV1],
+        terminalize: Callable[
+            [ReviewTaskSpecV1, ReviewTaskTerminalDraftV1],
+            ReviewTaskTerminalV1,
+        ],
+    ) -> None:
+        for method in ("admit", "list_tasks", "list_nonterminal", "list_terminals"):
+            if not callable(getattr(tasks, method, None)):
+                raise TypeError("review task store is incomplete")
+        if not callable(prepare_task) or not callable(terminalize):
+            raise TypeError("review task orchestration ports must be callable")
+        self._tasks = tasks
+        self._prepare_task = prepare_task
+        self._terminalize = terminalize
+
+    def execute(
+        self,
+        parent: RunLeaseV1,
+        parent_grant: StructuralGrantV1,
+        tasks: Sequence[ReviewTaskSpecV1],
+        *,
+        runtime: ReviewTaskRuntime,
+        max_concurrency: int,
+        root_contains: RootContainmentV1,
+        cancellation_check: Callable[[], bool],
+        created_by: str,
+    ) -> ReconciledReviewV1:
+        if type(runtime) is not ReviewTaskRuntime:
+            raise TypeError("runtime must use ReviewTaskRuntime")
+        admitted = self._tasks.admit(
+            parent_run_id=parent.run_id,
+            parent_grant=parent_grant,
+            tasks=tasks,
+            max_concurrency=max_concurrency,
+            root_contains=root_contains,
+            created_by=created_by,
+        )
+        if any(self._tasks.child_run_id(task) is not None for task in admitted):
+            return self.recover(
+                parent,
+                parent_grant,
+                cancellation_check=cancellation_check,
+            )
+        try:
+            for task in admitted:
+                prepared = self._prepare_task(task)
+                if (
+                    type(prepared) is not RunLeaseV1
+                    or self._tasks.child_run_id(task) != prepared.run_id
+                ):
+                    _reject(
+                        ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                        "prepared child run does not match its admitted task",
+                    )
+            runtime.execute(
+                admitted,
+                max_concurrency=max_concurrency,
+                cancellation_check=cancellation_check,
+            )
+            return self._reconciled(parent, parent_grant)
+        except Exception as execution_error:
+            try:
+                return self.recover(
+                    parent,
+                    parent_grant,
+                    cancellation_check=cancellation_check,
+                )
+            except Exception as recovery_error:
+                failure = ReviewTaskReconciliationError(
+                    ReviewTaskReconciliationCodeV1.TERMINAL_SET_MISMATCH,
+                    "worker execution and conservative task recovery both failed",
+                )
+                failure.add_note(f"execution failure type: {type(execution_error).__name__}")
+                raise failure from recovery_error
+
+    def recover(
+        self,
+        parent: RunLeaseV1,
+        parent_grant: StructuralGrantV1,
+        *,
+        cancellation_check: Callable[[], bool],
+    ) -> ReconciledReviewV1:
+        """Force every still-unbound task to a durable conservative terminal."""
+
+        if not callable(cancellation_check):
+            raise TypeError("cancellation_check must be callable")
+        for task in self._tasks.list_nonterminal(
+            parent.run_id,
+            parent_grant=parent_grant,
+        ):
+            try:
+                cancelled = cancellation_check()
+            except Exception as error:
+                raise ReviewTaskReconciliationError(
+                    ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+                    "parent cancellation check failed during task recovery",
+                ) from error
+            if type(cancelled) is not bool:
+                raise ReviewTaskReconciliationError(
+                    ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+                    "parent cancellation check returned a non-boolean",
+                )
+            self._terminalize(
+                task,
+                _recovery_intent(cancelled=cancelled),
+            )
+        return self._reconciled(parent, parent_grant)
+
+    def _reconciled(
+        self,
+        parent: RunLeaseV1,
+        parent_grant: StructuralGrantV1,
+    ) -> ReconciledReviewV1:
+        tasks = self._tasks.list_tasks(parent.run_id, parent_grant=parent_grant)
+        terminals = self._tasks.list_terminals(parent.run_id, parent_grant=parent_grant)
+        return reconcile_task_terminals(parent, tasks, terminals)
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledChildClaimV1:
+    """One child answer retained without deduplication or silent synthesis."""
+
+    task_id: str
+    child_run_id: str
+    answer: str
+    citations: tuple[CitationAdmissionV1, ...]
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        return {
+            "taskId": self.task_id,
+            "childRunId": self.child_run_id,
+            "answer": self.answer,
+            "citations": [citation.to_json_obj() for citation in self.citations],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledReviewV1:
+    """One deterministic parent result that retains every child limitation."""
+
+    outcome: TerminalOutcomeV1
+    answer: str | None
+    citations: tuple[CitationAdmissionV1, ...]
+    evidence_gap_codes: tuple[str, ...]
+    child_run_ids: tuple[str, ...]
+    child_outcomes: tuple[TerminalOutcomeV1, ...]
+    child_receipt_ids: tuple[str, ...]
+    child_terminal_digests: tuple[str, ...]
+    child_failure_codes: tuple[str | None, ...]
+    candidate_claims: tuple[ReconciledChildClaimV1, ...]
+    inspected_count: int
+    unreviewed_count: int
+    coverage_state: CoverageStateV1
+    provider_call_state: ProviderCallStateV1
+    provider_failure_diagnostic: ProviderFailureDiagnosticV1 | None
+    _authority: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._authority is not _RECONCILED_AUTHORITY:
+            raise ReviewTaskReconciliationError(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "reconciled review requires validated child terminal authority",
+            )
+        if self.provider_failure_diagnostic is not None and (
+            type(self.provider_failure_diagnostic) is not ProviderFailureDiagnosticV1
+            or self.outcome is not TerminalOutcomeV1.PROVIDER_FAILED
+        ):
+            raise ReviewTaskReconciliationError(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "reconciled provider failure diagnostic is invalid",
+            )
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        payload: dict[str, JsonValue] = {
+            "outcome": self.outcome.value,
+            "answer": self.answer,
+            "citations": [citation.to_json_obj() for citation in self.citations],
+            "evidenceGapCodes": list(self.evidence_gap_codes),
+            "childRunIds": list(self.child_run_ids),
+            "childOutcomes": [outcome.value for outcome in self.child_outcomes],
+            "childReceiptIds": list(self.child_receipt_ids),
+            "childTerminalDigests": list(self.child_terminal_digests),
+            "childFailureCodes": list(self.child_failure_codes),
+            "candidateClaims": [claim.to_json_obj() for claim in self.candidate_claims],
+            "inspectedCount": self.inspected_count,
+            "unreviewedCount": self.unreviewed_count,
+            "coverageState": self.coverage_state.value,
+            "providerCallState": self.provider_call_state.value,
+        }
+        if self.provider_failure_diagnostic is not None:
+            payload["providerFailureDiagnostic"] = cast(
+                JsonValue,
+                self.provider_failure_diagnostic.to_json_obj(),
+            )
+        return payload
+
+    @property
+    def digest(self) -> str:
+        return canonical_json_sha256_v1(self.to_json_obj())
+
+
+@dataclass(frozen=True, slots=True)
+class ParentTaskReceiptBridgeV1:
+    """Parent event-head and citation authority derived from durable child receipts."""
+
+    lease: RunLeaseV1
+    child_terminal_digests: tuple[str, ...]
+    child_event_sha256s: tuple[str, ...]
+    parent_citations: tuple[CitationAdmissionV1, ...]
+    _authority: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._authority is not _PARENT_BRIDGE_AUTHORITY:
+            raise ReviewTaskReconciliationError(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "parent citation bridge requires durable child receipt authority",
+            )
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        return {
+            "runId": self.lease.run_id,
+            "eventHeadSequence": self.lease.expected_head_sequence,
+            "eventHeadSha256": self.lease.expected_head_sha256,
+            "childTerminalDigests": list(self.child_terminal_digests),
+            "childEventSha256s": list(self.child_event_sha256s),
+            "parentCitations": [citation.to_json_obj() for citation in self.parent_citations],
+        }
+
+    @property
+    def digest(self) -> str:
+        return canonical_json_sha256_v1(self.to_json_obj())
+
+
+_FAILURE_GAPS = {
+    TerminalOutcomeV1.PROTOCOL_SUPERSEDED: "child_protocol_superseded",
+    TerminalOutcomeV1.POLICY_SUPERSEDED: "child_policy_superseded",
+    TerminalOutcomeV1.CANCELLED: "child_cancelled",
+    TerminalOutcomeV1.BUDGET_EXHAUSTED: "child_budget_exhausted",
+    TerminalOutcomeV1.PROVIDER_FAILED: "child_provider_failed",
+    TerminalOutcomeV1.ENGINE_FAILED: "child_engine_failed",
+    TerminalOutcomeV1.CLARIFICATION_REQUIRED: "child_clarification_required",
+}
+
+
+_OUTCOME_PRECEDENCE = (
+    TerminalOutcomeV1.CANCELLED,
+    TerminalOutcomeV1.PROTOCOL_SUPERSEDED,
+    TerminalOutcomeV1.POLICY_SUPERSEDED,
+    TerminalOutcomeV1.ENGINE_FAILED,
+    TerminalOutcomeV1.PROVIDER_FAILED,
+    TerminalOutcomeV1.BUDGET_EXHAUSTED,
+    TerminalOutcomeV1.CLARIFICATION_REQUIRED,
+    TerminalOutcomeV1.EVIDENCE_GAP,
+)
+
+
+_PROVIDER_PRECEDENCE = {
+    ProviderCallStateV1.NOT_REQUESTED: 0,
+    ProviderCallStateV1.BLOCKED_PREFLIGHT: 1,
+    ProviderCallStateV1.COMPLETED: 2,
+    ProviderCallStateV1.SENT: 3,
+    ProviderCallStateV1.OUTCOME_UNKNOWN: 4,
+}
+
+
+def reconcile_task_terminals(
+    parent: RunLeaseV1,
+    tasks: Sequence[ReviewTaskSpecV1],
+    children: Sequence[ReviewTaskTerminalV1],
+) -> ReconciledReviewV1:
+    """Validate and aggregate one complete admitted child set without inventing coverage."""
+
+    if type(parent) is not RunLeaseV1 or parent.expected_head_sha256 is None:
+        _reject(
+            ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+            "parent must be a started review-run lease",
+        )
+    admitted = _validated_tasks(parent, tasks)
+    terminals = _ordered_terminals(admitted, children)
+    _require_child_authority(admitted, terminals)
+
+    candidate_claims = tuple(
+        ReconciledChildClaimV1(
+            task.task_id,
+            terminal.child_run_id,
+            terminal.answer,
+            terminal.citations,
+        )
+        for task, terminal in zip(admitted, terminals, strict=True)
+        if terminal.outcome is TerminalOutcomeV1.SUPPORTED_ANSWER and terminal.answer is not None
+    )
+    citations = tuple(citation for claim in candidate_claims for citation in claim.citations)
+    child_outcomes = tuple(terminal.outcome for terminal in terminals)
+    outcome = _parent_outcome(child_outcomes, has_claims=bool(candidate_claims))
+    provider_failed_terminals = tuple(
+        terminal for terminal in terminals if terminal.outcome is TerminalOutcomeV1.PROVIDER_FAILED
+    )
+    first_provider_failure_diagnostic = (
+        provider_failed_terminals[0].review.provider_failure_diagnostic
+        if provider_failed_terminals
+        else None
+    )
+    provider_failure_diagnostic = (
+        first_provider_failure_diagnostic
+        if outcome is TerminalOutcomeV1.PROVIDER_FAILED
+        and first_provider_failure_diagnostic is not None
+        and all(
+            terminal.failure_code == "bad_request"
+            and terminal.review.provider_failure_diagnostic == first_provider_failure_diagnostic
+            for terminal in provider_failed_terminals
+        )
+        else None
+    )
+    coverage_state = _parent_coverage(terminals)
+    gaps = _ordered_gap_codes(terminals)
+    if coverage_state is not CoverageStateV1.COMPLETE:
+        gaps = _append_unique(gaps, "incomplete_child_coverage")
+    answer = (
+        "\n\n".join(claim.answer for claim in candidate_claims)
+        if outcome is TerminalOutcomeV1.SUPPORTED_ANSWER
+        else None
+    )
+    return ReconciledReviewV1(
+        outcome=outcome,
+        answer=answer,
+        citations=citations,
+        evidence_gap_codes=gaps,
+        child_run_ids=tuple(terminal.child_run_id for terminal in terminals),
+        child_outcomes=child_outcomes,
+        child_receipt_ids=tuple(terminal.receipt_id for terminal in terminals),
+        child_terminal_digests=tuple(terminal.digest for terminal in terminals),
+        child_failure_codes=tuple(terminal.failure_code for terminal in terminals),
+        candidate_claims=candidate_claims,
+        inspected_count=sum(terminal.inspected_count for terminal in terminals),
+        unreviewed_count=sum(terminal.unreviewed_count for terminal in terminals),
+        coverage_state=coverage_state,
+        provider_call_state=max(
+            (terminal.review.provider_call_state for terminal in terminals),
+            key=_PROVIDER_PRECEDENCE.__getitem__,
+        ),
+        provider_failure_diagnostic=provider_failure_diagnostic,
+        _authority=_RECONCILED_AUTHORITY,
+    )
+
+
+def bridge_task_terminals_to_parent(
+    parent: RunLeaseV1,
+    parent_grant: StructuralGrantV1,
+    tasks: Sequence[ReviewTaskSpecV1],
+    children: Sequence[ReviewTaskTerminalV1],
+    *,
+    ledger: ReviewRunLedger,
+    root_contains: RootContainmentV1,
+) -> ParentTaskReceiptBridgeV1:
+    """Append deterministic parent child-receipt events and re-admit exact citations."""
+
+    if type(parent_grant) is not StructuralGrantV1 or not callable(root_contains):
+        raise TypeError("parent grant and root containment authority are required")
+    if type(ledger) is not ReviewRunLedger:
+        raise TypeError("ledger must use ReviewRunLedger")
+    admitted = _validated_tasks(parent, tasks)
+    for task in admitted:
+        task.validate_under(parent_grant, root_contains=root_contains)
+    terminals = _ordered_terminals(admitted, children)
+    _require_child_authority(admitted, terminals)
+    lease = parent
+    event_sha256s: list[str] = []
+    parent_citations: list[CitationAdmissionV1] = []
+    seen_parent_citations: set[str] = set()
+    for task, terminal in zip(admitted, terminals, strict=True):
+        bridge_identity = canonical_json_sha256_v1(
+            {
+                "parentRunId": parent.run_id,
+                "taskId": task.task_id,
+                "ordinal": task.ordinal,
+                "childTerminalSha256": terminal.digest,
+            }
+        )
+        tool_call_id = f"child.{bridge_identity[:32]}"
+        event_id = f"event-child-{bridge_identity[:32]}"
+        payload: dict[str, JsonValue] = {
+            "toolCallId": tool_call_id,
+            "toolName": "child.review",
+            "resultSha256": terminal.digest,
+            "evidenceVersionId": parent_grant.evidence_binding.evidence_version_id,
+            "projectionRevisionId": parent_grant.evidence_binding.projection_revision_id,
+        }
+        existing = ledger.find_event(parent.run_id, event_id)
+        if existing is not None:
+            if (
+                existing.event_type is not ReviewEventTypeV1.TOOL_COMPLETED
+                or existing.payload.to_json_obj() != payload
+            ):
+                _reject(
+                    ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                    "existing parent child-terminal event conflicts with its receipt",
+                )
+            if not event_sha256s:
+                lease = RunLeaseV1(
+                    parent.run_id,
+                    existing.sequence - 1,
+                    existing.previous_event_sha256,
+                )
+            if (
+                existing.sequence != lease.expected_head_sequence + 1
+                or existing.previous_event_sha256 != lease.expected_head_sha256
+            ):
+                _reject(
+                    ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                    "parent child-terminal event chain is not contiguous",
+                )
+            lease = RunLeaseV1.from_event(existing)
+        else:
+            lease = ledger.append(
+                lease,
+                event_id=event_id,
+                event_type=ReviewEventTypeV1.TOOL_COMPLETED,
+                payload=payload,
+            )
+        if lease.expected_head_sha256 is None:
+            raise AssertionError("persisted child-terminal event has no digest")
+        event_sha256s.append(lease.expected_head_sha256)
+        for citation in terminal.citations:
+            parent_citation = _admit_child_citation_to_parent(
+                citation,
+                task=task,
+                parent_grant=parent_grant,
+                parent_tool_call_id=tool_call_id,
+                root_contains=root_contains,
+            )
+            if parent_citation.digest not in seen_parent_citations:
+                seen_parent_citations.add(parent_citation.digest)
+                parent_citations.append(parent_citation)
+    if ledger.current_lease(parent.run_id) != lease:
+        _reject(
+            ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+            "parent event head changed during child-terminal reconciliation",
+        )
+    return ParentTaskReceiptBridgeV1(
+        lease=lease,
+        child_terminal_digests=tuple(terminal.digest for terminal in terminals),
+        child_event_sha256s=tuple(event_sha256s),
+        parent_citations=tuple(parent_citations),
+        _authority=_PARENT_BRIDGE_AUTHORITY,
+    )
+
+
+def build_parent_terminal_draft(
+    reconciled: ReconciledReviewV1,
+    bridge: ParentTaskReceiptBridgeV1,
+    *,
+    clarification_question_id: str | None = None,
+) -> TerminalReviewDraftV1:
+    """Create the parent terminal only from a matching durable child-receipt bridge."""
+
+    if type(reconciled) is not ReconciledReviewV1 or type(bridge) is not ParentTaskReceiptBridgeV1:
+        raise TypeError("reconciled review and parent receipt bridge are required")
+    if bridge.child_terminal_digests != reconciled.child_terminal_digests:
+        _reject(
+            ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+            "parent receipt bridge does not match the reconciled child set",
+        )
+    supported = reconciled.outcome is TerminalOutcomeV1.SUPPORTED_ANSWER
+    if supported and not bridge.parent_citations:
+        _reject(
+            ReviewTaskReconciliationCodeV1.OUT_OF_GRANT_CITATION,
+            "supported parent result has no parent-admitted citations",
+        )
+    return TerminalReviewDraftV1(
+        outcome=reconciled.outcome,
+        answer=reconciled.answer if supported else None,
+        citations=bridge.parent_citations if supported else (),
+        evidence_gap_codes=reconciled.evidence_gap_codes,
+        inspected_count=reconciled.inspected_count,
+        unreviewed_count=reconciled.unreviewed_count,
+        coverage_state=reconciled.coverage_state,
+        clarification_question_id=clarification_question_id,
+        provider_call_state=reconciled.provider_call_state,
+        provider_failure_diagnostic=reconciled.provider_failure_diagnostic,
+    )
+
+
+def _validated_tasks(
+    parent: RunLeaseV1,
+    tasks: Sequence[ReviewTaskSpecV1],
+) -> tuple[ReviewTaskSpecV1, ...]:
+    if not isinstance(tasks, Sequence) or isinstance(tasks, str | bytes) or not tasks:
+        _reject(
+            ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+            "reconciliation requires a non-empty admitted task set",
+        )
+    admitted = tuple(tasks)
+    if any(type(task) is not ReviewTaskSpecV1 for task in admitted):
+        _reject(
+            ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+            "task set contains an invalid review task",
+        )
+    ordered = tuple(sorted(admitted, key=lambda task: task.ordinal))
+    if (
+        tuple(task.ordinal for task in ordered) != tuple(range(len(ordered)))
+        or len({task.task_id for task in ordered}) != len(ordered)
+        or any(task.parent_run_id != parent.run_id for task in ordered)
+    ):
+        _reject(
+            ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+            "task set does not match the parent run authority",
+        )
+    return ordered
+
+
+def _ordered_terminals(
+    tasks: tuple[ReviewTaskSpecV1, ...],
+    children: Sequence[ReviewTaskTerminalV1],
+) -> tuple[ReviewTaskTerminalV1, ...]:
+    if (
+        not isinstance(children, Sequence)
+        or isinstance(children, str | bytes)
+        or any(type(child) is not ReviewTaskTerminalV1 for child in children)
+    ):
+        _reject(
+            ReviewTaskReconciliationCodeV1.INVALID_ARGUMENT,
+            "terminal set contains an invalid child terminal",
+        )
+    terminal_by_task: dict[str, ReviewTaskTerminalV1] = {}
+    for child in children:
+        if child.task_id in terminal_by_task:
+            _reject(
+                ReviewTaskReconciliationCodeV1.DUPLICATE_TERMINAL,
+                "duplicate child terminal is not reconcilable",
+            )
+        terminal_by_task[child.task_id] = child
+    expected_ids = {task.task_id for task in tasks}
+    if set(terminal_by_task) != expected_ids:
+        _reject(
+            ReviewTaskReconciliationCodeV1.TERMINAL_SET_MISMATCH,
+            "child terminal set is missing or contains an unadmitted task",
+        )
+    return tuple(terminal_by_task[task.task_id] for task in tasks)
+
+
+def _require_child_authority(
+    tasks: tuple[ReviewTaskSpecV1, ...],
+    terminals: tuple[ReviewTaskTerminalV1, ...],
+) -> None:
+    child_run_ids: set[str] = set()
+    receipt_ids: set[str] = set()
+    for task, terminal in zip(tasks, terminals, strict=True):
+        if (
+            terminal.task_id != task.task_id
+            or terminal.parent_run_id != task.parent_run_id
+            or terminal.child_run_id == task.parent_run_id
+            or terminal.grant_id != task.grant.grant_id
+            or terminal.grant_sha256 != task.grant.digest
+        ):
+            _reject(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "child terminal does not match its task or parent authority",
+            )
+        if terminal.child_run_id in child_run_ids or terminal.receipt_id in receipt_ids:
+            _reject(
+                ReviewTaskReconciliationCodeV1.DUPLICATE_TERMINAL,
+                "duplicate child run or receipt cannot satisfy two tasks",
+            )
+        child_run_ids.add(terminal.child_run_id)
+        receipt_ids.add(terminal.receipt_id)
+        if any(
+            citation.grant_id != task.grant.grant_id or citation.grant_sha256 != task.grant.digest
+            for citation in terminal.citations
+        ):
+            _reject(
+                ReviewTaskReconciliationCodeV1.OUT_OF_GRANT_CITATION,
+                "child citation does not match its exact task grant",
+            )
+
+
+def _parent_outcome(
+    child_outcomes: tuple[TerminalOutcomeV1, ...],
+    *,
+    has_claims: bool,
+) -> TerminalOutcomeV1:
+    for candidate in _OUTCOME_PRECEDENCE:
+        if candidate in child_outcomes:
+            return candidate
+    return TerminalOutcomeV1.SUPPORTED_ANSWER if has_claims else TerminalOutcomeV1.ABSTAINED
+
+
+def _parent_coverage(
+    terminals: tuple[ReviewTaskTerminalV1, ...],
+) -> CoverageStateV1:
+    failed = any(terminal.outcome in _FAILURE_GAPS for terminal in terminals)
+    if (
+        not failed
+        and all(terminal.coverage_state is CoverageStateV1.COMPLETE for terminal in terminals)
+        and not any(terminal.unreviewed_count for terminal in terminals)
+    ):
+        return CoverageStateV1.COMPLETE
+    if (
+        not failed
+        and all(terminal.coverage_state is CoverageStateV1.NOT_ASSESSED for terminal in terminals)
+        and not any(terminal.inspected_count or terminal.unreviewed_count for terminal in terminals)
+    ):
+        return CoverageStateV1.NOT_ASSESSED
+    return CoverageStateV1.PARTIAL
+
+
+def _ordered_gap_codes(
+    terminals: tuple[ReviewTaskTerminalV1, ...],
+) -> tuple[str, ...]:
+    gaps: tuple[str, ...] = ()
+    for terminal in terminals:
+        for code in terminal.evidence_gap_codes:
+            gaps = _append_unique(gaps, code)
+        failure_code = _FAILURE_GAPS.get(terminal.outcome)
+        if failure_code is not None:
+            gaps = _append_unique(gaps, failure_code)
+    return gaps
+
+
+def _admit_child_citation_to_parent(
+    citation: CitationAdmissionV1,
+    *,
+    task: ReviewTaskSpecV1,
+    parent_grant: StructuralGrantV1,
+    parent_tool_call_id: str,
+    root_contains: RootContainmentV1,
+) -> CitationAdmissionV1:
+    address = citation.address.to_json_obj()
+    child_root_id = address["rootAnchorId"]
+    child_root = next(
+        (root for root in task.grant.evidence_roots if root.stable_id == child_root_id),
+        None,
+    )
+    if child_root is None:
+        _reject(
+            ReviewTaskReconciliationCodeV1.OUT_OF_GRANT_CITATION,
+            "child citation root does not match its task grant",
+        )
+    parent_roots: list[EvidenceRootRefV1] = []
+    for parent_root in parent_grant.evidence_roots:
+        try:
+            contained = root_contains(parent_root, child_root)
+        except Exception as error:
+            raise ReviewTaskReconciliationError(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "parent citation containment authority failed",
+            ) from error
+        if type(contained) is not bool:
+            _reject(
+                ReviewTaskReconciliationCodeV1.AUTHORITY_MISMATCH,
+                "parent citation containment returned a non-boolean",
+            )
+        if contained:
+            parent_roots.append(parent_root)
+    if len(parent_roots) != 1:
+        _reject(
+            ReviewTaskReconciliationCodeV1.OUT_OF_GRANT_CITATION,
+            "child citation does not map to exactly one parent root",
+        )
+    address["rootAnchorId"] = parent_roots[0].stable_id
+    address["admittedByToolCallId"] = parent_tool_call_id
+    return CitationAdmissionV1.create(
+        address=address,
+        grant=parent_grant,
+        admitted_tool_call_ids=(parent_tool_call_id,),
+    )
+
+
+def _recovery_intent(*, cancelled: bool) -> ReviewTaskTerminalDraftV1:
+    return ReviewTaskTerminalDraftV1(
+        TerminalReviewDraftV1(
+            outcome=(TerminalOutcomeV1.CANCELLED if cancelled else TerminalOutcomeV1.ENGINE_FAILED),
+            answer=None,
+            citations=(),
+            evidence_gap_codes=(),
+            inspected_count=0,
+            unreviewed_count=1,
+            coverage_state=CoverageStateV1.PARTIAL,
+            clarification_question_id=None,
+            provider_call_state=ProviderCallStateV1.NOT_REQUESTED,
+        ),
+        failure_code=("parent_cancelled_recovery" if cancelled else "abandoned_task_recovery"),
+    )
+
+
+def _append_unique(values: tuple[str, ...], value: str) -> tuple[str, ...]:
+    return values if value in values else (*values, value)
+
+
+def _reject(code: ReviewTaskReconciliationCodeV1, message: str) -> NoReturn:
+    raise ReviewTaskReconciliationError(code, message)

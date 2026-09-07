@@ -25,7 +25,10 @@ provider records, customer material, credentials, or unreleased product composit
 
 - `.github/` — contribution forms, review ownership, and scoped CI.
 - `scripts/` — the preliminary check and public-boundary audit.
-- Future component source, tests, examples, and docs arrive only through repository-local Issues.
+- `src/sangrep_harness/` — engine, reference adapters and CLI.
+- `tests/`, `corpus/`, `examples/` — deterministic tests and synthetic examples.
+- `docs/`, `mkdocs.yml` — developer guides, reference and local preview.
+- `provenance/` — immutable dependency and technical source inventory.
 
 ## Dependency direction
 

@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Generate/check technical source mapping from accepted sanitized import inventories."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ADAPTED = {
+    "evidence_head.py.txt": [
+        "src/sangrep_harness/evidence_head.py",
+        "src/sangrep_harness/evidence_models.py",
+    ],
+    "evidence_tools.py.txt": ["src/sangrep_harness/tools.py"],
+    "structural_loop.py.txt": ["src/sangrep_harness/structural_loop.py"],
+    "provider_exchange.py.txt": ["src/sangrep_harness/providers/exchange.py"],
+    "run_ledger.py.txt": ["src/sangrep_harness/ledger.py"],
+    "terminal_recovery.py.txt": ["src/sangrep_harness/ledger.py"],
+    "durable_tasks.py.txt": [
+        "src/sangrep_harness/task_orchestration.py",
+        "src/sangrep_harness/task_store.py",
+    ],
+}
+
+
+def build() -> dict[str, object]:
+    inventory = json.loads((ROOT / "provenance/import/BUNDLE.json").read_text())
+    origin = json.loads((ROOT / "provenance/engine-import-v1.json").read_text())
+    original = json.loads((ROOT / "provenance/import/BUNDLE-original.json").read_text())
+    original_digest = hashlib.sha256(
+        json.dumps(original["files"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if (
+        origin["files"] != inventory["files"]
+        or origin["treeSha256"] != inventory["treeSha256"]
+        or original_digest != original["treeSha256"]
+        or original_digest != origin["originalTreeSha256"]
+    ):
+        raise ValueError("import-record-consistency")
+    canonical = json.dumps(inventory["files"], sort_keys=True, separators=(",", ":")).encode()
+    if hashlib.sha256(canonical).hexdigest() != inventory["treeSha256"]:
+        raise ValueError("import-inventory")
+    for name, digest in inventory["files"].items():
+        if name.startswith("adaptation/") or name in {
+            "README.md",
+            "ORIGIN.md",
+            "ADAPTERS.md",
+            "LICENSE-STATUS.md",
+        }:
+            path = ROOT / "provenance/import" / name
+            if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError("retained-import-input")
+    mapped: dict[str, object] = {}
+    for root_name in ("src", "tests", "examples", "corpus"):
+        for path in sorted((ROOT / root_name).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            if path.is_symlink():
+                raise ValueError("source-link")
+            name = path.relative_to(ROOT).as_posix()
+            inputs = {name: inventory["files"][name]} if name in inventory["files"] else {}
+            for source, destinations in ADAPTED.items():
+                if name in destinations:
+                    inputs[f"adaptation/{source}"] = inventory["files"][f"adaptation/{source}"]
+            mapped[name] = {
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "importInputs": inputs,
+                "origin": "adapted-import" if inputs else "repository-owned",
+            }
+    return {"schemaVersion": 1, "importTreeSha256": inventory["treeSha256"], "files": mapped}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--write", action="store_true")
+    arguments = parser.parse_args()
+    try:
+        value = build()
+        path = ROOT / "provenance/integration-map-v1.json"
+        if arguments.write:
+            path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        elif json.loads(path.read_text()) != value:
+            raise ValueError("integration-map-drift")
+    except (OSError, ValueError, KeyError, TypeError):
+        print("provenance-map: blocked")
+        return 1
+    print("provenance-map: passed technical-inventory-only")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,58 @@
+site_name: Sangrep Harness
+site_description: Bounded, deterministic cited evidence review
+site_url: https://sangrep.github.io/harness/
+repo_url: https://github.com/sangrep/harness
+edit_uri: edit/master/docs/
+site_dir: work/docs-site
+strict: true
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+  palette:
+    scheme: default
+    primary: teal
+    accent: amber
+  font: false
+plugins:
+  - search
+  - mkdocstrings:
+      enable_inventory: false
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: false
+            show_signature_annotations: true
+            separate_signature: true
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - tables
+nav:
+  - Overview: index.md
+  - Guides:
+      - Quickstart: guides/quickstart.md
+      - JSON and JSONL: guides/cli.md
+      - Adapters: guides/adapters.md
+      - Replay: guides/replay.md
+      - Gaps and recovery: guides/outcomes.md
+  - Reference:
+      - Library: reference/api.md
+      - Engine: reference/engine.md
+      - Recovery: reference/recovery.md
+  - Concepts:
+      - Authority: concepts/authority.md
+      - Evidence and citations: concepts/evidence.md
+      - Replay: concepts/replay.md
+  - Compatibility: compatibility.md
+  - Threat model: threat-model.md
+  - Evaluation: evaluation.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Licensing: development/licensing.md
+      - Import accounting: development/import-accounting.md
+      - Implementation: development/implementation.md

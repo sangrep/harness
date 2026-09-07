@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Protocol
+from sangrep_harness.review import ProviderCallStateV1, StructuralGrantV1
+from sangrep_harness.ports import PreflightStateV1, ReviewPreflightV1, ReviewPreflightV2
+from sangrep_harness.terminal import PersistedReviewTerminalV1, TerminalReviewDraftV1, build_terminalization_v1
+from sangrep_harness.ports import ReviewRunAdmissionSeedV1, ReviewTaskRouteDecisionV1, ReviewTaskRouteError, ReviewTaskRouteFailureCodeV1
+from sangrep_harness.wire import FrozenJsonObjectV1, JsonValue, ReviewEventTypeV1, ReviewEventV1, ReviewStartV1, canonical_json_sha256_v1, freeze_json_object_v1
+from sangrep_harness.task_runtime import ReviewTaskSpecV1
+
+
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class ReviewRunError(RuntimeError):
+    """Base class for sanitized durable review-run failures."""
+
+
+class ReviewRunConflict(ReviewRunError):
+    """The caller used a stale compare-and-append lease."""
+
+
+@dataclass(frozen=True, slots=True)
+class RunLeaseV1:
+    """One optimistic event-head authority token."""
+
+    run_id: str
+    expected_head_sequence: int
+    expected_head_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.run_id) is not str or _IDENTIFIER.fullmatch(self.run_id) is None:
+            raise ValueError("run_id must be a bounded identifier")
+        if type(self.expected_head_sequence) is not int or self.expected_head_sequence < -1:
+            raise ValueError("expected event head sequence is invalid")
+        if self.expected_head_sequence == -1:
+            if self.expected_head_sha256 is not None:
+                raise ValueError("a run before start cannot carry an event head")
+        elif (
+            type(self.expected_head_sha256) is not str
+            or _SHA256.fullmatch(self.expected_head_sha256) is None
+        ):
+            raise ValueError("expected event head must be lowercase SHA-256")
+
+    @classmethod
+    def before_start(cls, run_id: str) -> RunLeaseV1:
+        return cls(run_id, -1, None)
+
+    @classmethod
+    def from_event(cls, event: ReviewEventV1) -> RunLeaseV1:
+        if type(event) is not ReviewEventV1:
+            raise TypeError("event must use ReviewEventV1")
+        return cls(event.run_id, event.sequence, event.digest)
+
+
+class ReviewRunRepositoryV1(Protocol):
+    """Encrypted workspace persistence used by the run ledger."""
+
+    def start_run(
+        self,
+        *,
+        run_id: str,
+        start: ReviewStartV1,
+        preflight: ReviewPreflightV1 | ReviewPreflightV2,
+        grant: StructuralGrantV1,
+        created_by: str,
+        first_event: ReviewEventV1,
+        parent_run_id: str | None = None,
+        task_id: str | None = None,
+        run_admission_seed_sha256: str | None = None,
+        route_decision_sha256: str | None = None,
+    ) -> RunLeaseV1: ...
+
+    def current_lease(self, run_id: str) -> RunLeaseV1: ...
+
+    def append_event(self, lease: RunLeaseV1, event: ReviewEventV1) -> RunLeaseV1: ...
+
+    def preflight_for_run(self, run_id: str) -> ReviewPreflightV1 | ReviewPreflightV2: ...
+
+    def find_event(self, run_id: str, event_id: str) -> ReviewEventV1 | None: ...
+
+    def terminalize(
+        self,
+        lease: RunLeaseV1,
+        terminal: PersistedReviewTerminalV1,
+        *,
+        grant: StructuralGrantV1,
+    ) -> PersistedReviewTerminalV1: ...
+
+    def get_terminal(
+        self,
+        run_id: str,
+        *,
+        grant: StructuralGrantV1,
+    ) -> PersistedReviewTerminalV1: ...
+
+    def is_cancellation_requested(self, run_id: str) -> bool: ...
+
+    def list_nonterminal_run_ids(self) -> tuple[str, ...]: ...
+
+    def is_unfinished_legacy_gpt55_run(self, run_id: str) -> bool: ...
+
+    def provider_call_state(self, run_id: str) -> ProviderCallStateV1: ...
+
+
+class ReviewRunLedger:
+    """Construct contract values and delegate only atomic persistence operations."""
+
+    __slots__ = ("repository",)
+
+    def __init__(self, repository: ReviewRunRepositoryV1) -> None:
+        for method in (
+            "start_run",
+            "current_lease",
+            "append_event",
+            "preflight_for_run",
+            "terminalize",
+            "get_terminal",
+            "is_cancellation_requested",
+            "list_nonterminal_run_ids",
+            "provider_call_state",
+        ):
+            if not callable(getattr(repository, method, None)):
+                raise TypeError("review run repository is incomplete")
+        self.repository = repository
+
+    def start(
+        self,
+        start: ReviewStartV1,
+        *,
+        preflight: ReviewPreflightV1,
+        grant: StructuralGrantV1,
+        created_by: str,
+        run_admission: ReviewRunAdmissionSeedV1 | None = None,
+        route_decision: ReviewTaskRouteDecisionV1 | None = None,
+    ) -> RunLeaseV1:
+        routed = run_admission is not None or route_decision is not None
+        if routed:
+            if (
+                type(run_admission) is not ReviewRunAdmissionSeedV1
+                or type(route_decision) is not ReviewTaskRouteDecisionV1
+            ):
+                raise ReviewRunConflict("routed review start authority is incomplete")
+            _require_routed_start_authority(
+                start,
+                run_admission=run_admission,
+                route_decision=route_decision,
+                preflight=preflight,
+                grant=grant,
+            )
+            _require_start_authority(start, preflight=preflight, grant=grant)
+            run_id = run_admission.parent_run_id
+        else:
+            _require_start_authority(start, preflight=preflight, grant=grant)
+            if start.parent_run_id is not None or preflight.route_decision_sha256 is not None:
+                raise ReviewRunConflict("legacy review start contains routed authority")
+            run_id = f"run-{preflight.request_digest[:32]}"
+        event_payload: dict[str, JsonValue] = {
+            "grantSha256": grant.digest,
+            "contextSha256": preflight.context_binding.digest,
+            "egressPolicySha256": preflight.egress_policy.digest,
+        }
+        if routed:
+            assert route_decision is not None
+            event_payload.update(
+                {
+                    "routeDecisionSha256": route_decision.decision_sha256,
+                    "routePolicySha256": route_decision.route_policy_sha256,
+                    "pricingAuthoritySha256": route_decision.pricing_authority_sha256,
+                    "providerId": route_decision.provider_id,
+                    "modelId": route_decision.model_id,
+                }
+            )
+        event = build_review_event_v1(
+            RunLeaseV1.before_start(run_id),
+            event_id=f"event-{run_id}-000000",
+            event_type=ReviewEventTypeV1.RUN_STARTED,
+            payload=event_payload,
+        )
+        if routed:
+            assert run_admission is not None and route_decision is not None
+            return self.repository.start_run(
+                run_id=run_id,
+                start=start,
+                preflight=preflight,
+                grant=grant,
+                created_by=created_by,
+                first_event=event,
+                run_admission_seed_sha256=run_admission.canonical_sha256,
+                route_decision_sha256=route_decision.decision_sha256,
+            )
+        return self.repository.start_run(
+            run_id=run_id,
+            start=start,
+            preflight=preflight,
+            grant=grant,
+            created_by=created_by,
+            first_event=event,
+        )
+
+    def start_child(
+        self,
+        task: object,
+        start: ReviewStartV1,
+        *,
+        preflight: ReviewPreflightV1,
+        created_by: str,
+        route_decision: ReviewTaskRouteDecisionV1 | None = None,
+    ) -> RunLeaseV1:
+        """Start one child run only through its already-admitted task authority."""
+
+        from sangrep_harness.task_runtime import ReviewTaskSpecV1
+
+        if type(task) is not ReviewTaskSpecV1:
+            raise TypeError("task must use ReviewTaskSpecV1")
+        _require_start_authority(start, preflight=preflight, grant=task.grant)
+        if start.question != task.instruction or preflight.question != task.instruction:
+            raise ReviewRunConflict("child review start does not match its task instruction")
+        if route_decision is None:
+            if preflight.route_decision_sha256 is not None:
+                raise ReviewRunConflict("legacy child start contains routed authority")
+        elif (
+            route_decision.task_id != task.task_id
+            or route_decision.parent_run_id != task.parent_run_id
+            or preflight.route_decision_sha256 != route_decision.decision_sha256
+            or preflight.route_policy_sha256 != route_decision.route_policy_sha256
+            or preflight.pricing_authority_sha256 != route_decision.pricing_authority_sha256
+            or preflight.provider_id != route_decision.provider_id
+            or preflight.model_id != route_decision.model_id
+            or start.parent_run_id != route_decision.parent_run_id
+            or start.run_admission_seed_sha256 != route_decision.run_admission_seed_sha256
+        ):
+            raise ReviewTaskRouteError(
+                ReviewTaskRouteFailureCodeV1.PROVIDER_MODEL_SUBSTITUTION,
+                "Routed child start does not match its immutable route decision.",
+            )
+        run_id = f"run-{preflight.request_digest[:32]}"
+        event_payload: dict[str, JsonValue] = {
+            "grantSha256": task.grant.digest,
+            "contextSha256": preflight.context_binding.digest,
+            "egressPolicySha256": preflight.egress_policy.digest,
+        }
+        if route_decision is not None:
+            event_payload.update(
+                {
+                    "routeDecisionSha256": route_decision.decision_sha256,
+                    "routePolicySha256": route_decision.route_policy_sha256,
+                    "pricingAuthoritySha256": route_decision.pricing_authority_sha256,
+                    "providerId": route_decision.provider_id,
+                    "modelId": route_decision.model_id,
+                }
+            )
+        event = build_review_event_v1(
+            RunLeaseV1.before_start(run_id),
+            event_id=f"event-{run_id}-000000",
+            event_type=ReviewEventTypeV1.RUN_STARTED,
+            payload=event_payload,
+        )
+        return self.repository.start_run(
+            run_id=run_id,
+            start=start,
+            preflight=preflight,
+            grant=task.grant,
+            created_by=created_by,
+            first_event=event,
+            parent_run_id=task.parent_run_id,
+            task_id=task.task_id,
+            route_decision_sha256=(
+                None if route_decision is None else route_decision.decision_sha256
+            ),
+        )
+
+    def current_lease(self, run_id: str) -> RunLeaseV1:
+        return self.repository.current_lease(run_id)
+
+    def append(
+        self,
+        lease: RunLeaseV1,
+        *,
+        event_id: str,
+        event_type: ReviewEventTypeV1,
+        payload: dict[str, JsonValue],
+    ) -> RunLeaseV1:
+        event = build_review_event_v1(
+            lease,
+            event_id=event_id,
+            event_type=event_type,
+            payload=payload,
+        )
+        return self.repository.append_event(lease, event)
+
+    def find_event(self, run_id: str, event_id: str) -> ReviewEventV1 | None:
+        finder = getattr(self.repository, "find_event", None)
+        if not callable(finder):
+            raise TypeError("review run repository does not expose event lookup")
+        event = finder(run_id, event_id)
+        if event is not None and type(event) is not ReviewEventV1:
+            raise ReviewRunConflict("review event lookup returned an invalid value")
+        return event
+
+    def terminalize(
+        self,
+        lease: RunLeaseV1,
+        draft: TerminalReviewDraftV1,
+        *,
+        preflight: ReviewPreflightV1,
+        grant: StructuralGrantV1,
+        recovery_reason_code: str | None = None,
+    ) -> PersistedReviewTerminalV1:
+        _require_preflight_grant(preflight, grant)
+        durable_preflight = self.repository.preflight_for_run(lease.run_id)
+        if type(durable_preflight) is not ReviewPreflightV1:
+            raise ReviewRunConflict("V1 terminalization requires its exact V1 run preflight")
+        _require_preflight_grant(durable_preflight, grant)
+        terminal = build_terminalization_v1(
+            lease=lease,
+            draft=draft,
+            preflight=durable_preflight,
+            grant=grant,
+            recovery_reason_code=recovery_reason_code,
+        )
+        return self.repository.terminalize(lease, terminal, grant=grant)
+
+    def get_terminal(
+        self,
+        run_id: str,
+        *,
+        grant: StructuralGrantV1,
+    ) -> PersistedReviewTerminalV1:
+        return self.repository.get_terminal(run_id, grant=grant)
+
+    def is_cancellation_requested(self, run_id: str) -> bool:
+        return self.repository.is_cancellation_requested(run_id)
+
+    def provider_call_state(self, run_id: str) -> ProviderCallStateV1:
+        return self.repository.provider_call_state(run_id)
+
+
+def build_review_event_v1(
+    lease: RunLeaseV1,
+    *,
+    event_id: str,
+    event_type: ReviewEventTypeV1,
+    payload: dict[str, JsonValue],
+) -> ReviewEventV1:
+    """Build the only valid successor event for one lease."""
+
+    if type(lease) is not RunLeaseV1:
+        raise TypeError("lease must use RunLeaseV1")
+    frozen: FrozenJsonObjectV1 = freeze_json_object_v1(payload)
+    return ReviewEventV1(
+        event_id=event_id,
+        run_id=lease.run_id,
+        sequence=lease.expected_head_sequence + 1,
+        event_type=event_type,
+        previous_event_sha256=lease.expected_head_sha256,
+        payload=frozen,
+        payload_sha256=canonical_json_sha256_v1(payload),
+    )
+
+
+def _require_start_authority(
+    start: ReviewStartV1,
+    *,
+    preflight: ReviewPreflightV1,
+    grant: StructuralGrantV1,
+) -> None:
+    if type(start) is not ReviewStartV1:
+        raise TypeError("start must use ReviewStartV1")
+    _require_preflight_grant(preflight, grant)
+    payload = start.command.payload.to_json_obj()
+    expected_roots = tuple(
+        (root.evidence_version_id, root.stable_id) for root in grant.evidence_roots
+    )
+    if (
+        start.question != preflight.question
+        or start.evidence_roots != expected_roots
+        or payload["grantId"] != grant.grant_id
+        or payload["grantSha256"] != grant.digest
+        or payload["contextSha256"] != preflight.context_binding.digest
+        or payload["egressPolicySha256"] != preflight.egress_policy.digest
+        or payload["limitsSha256"] != preflight.limits.digest
+        or start.clarification_mode != preflight.context_binding.clarification_mode.value
+        or start.evaluator_suite_id != preflight.local_evaluator_identity.profile_version
+    ):
+        raise ReviewRunConflict("review.start does not match the approved preflight authority")
+
+
+def _require_preflight_grant(
+    preflight: ReviewPreflightV1,
+    grant: StructuralGrantV1,
+) -> None:
+    if type(preflight) is not ReviewPreflightV1 or type(grant) is not StructuralGrantV1:
+        raise TypeError("preflight and grant must use frozen review contracts")
+    if (
+        preflight.state is not PreflightStateV1.APPROVED
+        or preflight.grant_id != grant.grant_id
+        or preflight.grant_digest != grant.digest
+        or preflight.evidence_digest != grant.evidence_binding.digest
+        or preflight.projection_id != grant.evidence_binding.projection_revision_id
+        or preflight.projection_digest != grant.evidence_binding.projection_payload_sha256
+        or preflight.limits.digest != grant.limits.digest
+    ):
+        raise ReviewRunConflict("review preflight authority is stale or inconsistent")
+
+
+def _require_routed_start_authority(
+    start: ReviewStartV1,
+    *,
+    run_admission: ReviewRunAdmissionSeedV1,
+    route_decision: ReviewTaskRouteDecisionV1,
+    preflight: ReviewPreflightV1,
+    grant: StructuralGrantV1,
+) -> None:
+    if (
+        start.command.request_id != run_admission.caller_request_id
+        or start.parent_run_id != run_admission.parent_run_id
+        or start.run_admission_seed_sha256 != run_admission.canonical_sha256
+        or canonical_json_sha256_v1(start.question) != run_admission.normalized_question_sha256
+        or grant.digest != run_admission.grant_sha256
+        or preflight.context_binding.digest != run_admission.context_sha256
+        or preflight.limits.digest != run_admission.limits_sha256
+        or route_decision.parent_run_id != run_admission.parent_run_id
+        or route_decision.run_admission_seed_sha256 != run_admission.canonical_sha256
+    ):
+        raise ReviewRunConflict("routed review start does not match run admission")
+    if (
+        preflight.route_decision_sha256 != route_decision.decision_sha256
+        or preflight.route_policy_sha256 != route_decision.route_policy_sha256
+        or preflight.pricing_authority_sha256 != route_decision.pricing_authority_sha256
+        or preflight.provider_id != route_decision.provider_id
+        or preflight.model_id != route_decision.model_id
+    ):
+        raise ReviewTaskRouteError(
+            ReviewTaskRouteFailureCodeV1.PROVIDER_MODEL_SUBSTITUTION,
+            "Routed preflight does not match the immutable route decision.",
+        )
